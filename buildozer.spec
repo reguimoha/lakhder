@@ -39,7 +39,7 @@ fullscreen = 1
 requirements = python3,hostpython3,kivy==2.3.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3,idna,certifi,charset-normalizer,psutil,pypdf,pillow,arabic_reshaper,python-bidi,numpy,llama-cpp-python==0.3.16
 
 # Local recipes folder (cross-compiles the inference engine for Android)
-p4a.local_recipes = ./recipes
+# p4a.local_recipes = ./recipes
 
 # python-for-android branch (develop is needed for custom CMake recipes on recent NDKs)
 p4a.branch = develop
