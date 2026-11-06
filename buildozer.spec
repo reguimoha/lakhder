@@ -53,7 +53,7 @@ android.archs = arm64-v8a
 # Android API levels / NDK
 android.api = 34
 android.minapi = 24
-android.ndk = 25b
+android.ndk = 27.3.13750724
 
 # Accept SDK licenses automatically (required for non-interactive builds)
 android.accept_sdk_license = True
