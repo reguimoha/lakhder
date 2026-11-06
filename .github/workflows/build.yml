@@ -30,9 +30,14 @@ jobs:
           pip install --upgrade pip
           pip install --upgrade buildozer cython
 
+      
+
       - name: Build with Buildozer
+        env:
+          ANDROIDNDK: /usr/local/lib/android/sdk/ndk/27.3.13750724
         run: |
           buildozer -v android debug
+      
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
