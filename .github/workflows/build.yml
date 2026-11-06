@@ -1,5 +1,7 @@
 name: Build Android APK
 
+
+       
 on:
   push:
     branches: [ main ]
@@ -8,6 +10,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Clean Everything
+        run: |     
+          rm -rf .buildozer bin .old_buildozer
+
+
+    
       - name: Checkout Code
         uses: actions/checkout@v4
 
