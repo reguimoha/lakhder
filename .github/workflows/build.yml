@@ -29,11 +29,16 @@ jobs:
           pip install --upgrade pip
           pip install --upgrade buildozer cython
 
+      - name: Clean Old Buildozer Cache to Prevent Conflicts
+        run: |
+          rm -rf .buildozer/android/platform/android-ndk*
+
       - name: Build with Buildozer
         env:
-          # توجيه Buildozer للاستفادة من الـ SDK والـ NDK المثبتين مسبقاً في مسارات عمال GitHub
           ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_NDK: /usr/local/lib/android/sdk/ndk/25.2.9519653
           ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
+          ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/25.2.9519653
         run: |
           buildozer -v android debug
 
