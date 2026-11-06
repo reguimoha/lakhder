@@ -33,7 +33,7 @@ jobs:
         env:
           # توجيه Buildozer للاستفادة من الـ SDK والـ NDK المثبتين مسبقاً في مسارات عمال GitHub
           ANDROID_HOME: /usr/local/lib/android/sdk
-          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/27.3.13750724
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
         run: |
           buildozer -v android debug
 
