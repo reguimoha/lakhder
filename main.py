@@ -9372,26 +9372,38 @@ PALETTES: Dict[str, Dict[str, str]] = {
 }
 
 
+
 def register_fonts() -> None:
-    regular = FONTS_DIR / "DejaVuSans.ttf"
-    bold = FONTS_DIR / "DejaVuSans-Bold.ttf"
-    if not regular.exists():
-        LOG.warning("bundled DejaVuSans.ttf missing; falling back to Kivy default font")
-        return
-    try:
-        LabelBase.register(
-            name=FONT,
-            fn_regular=str(regular),
-            fn_bold=str(bold if bold.exists() else regular),
-        )
-        # Kivy's default family also needs Arabic presentation forms.
-        LabelBase.register(
-            name="Roboto",
-            fn_regular=str(regular),
-            fn_bold=str(bold if bold.exists() else regular),
-        )
-    except Exception as exc:  # noqa: BLE001
-        LOG.error("font registration failed", exc)
+    from kivy.resources import resource_find
+
+    candidates = [
+        (FONTS_DIR / "DejaVuSans.ttf", FONTS_DIR / "DejaVuSans-Bold.ttf"),
+        (Path("/system/fonts/NotoNaskhArabic-Regular.ttf"),
+         Path("/system/fonts/NotoNaskhArabic-Bold.ttf")),
+        (Path("/system/fonts/NotoSansArabic-Regular.ttf"),
+         Path("/system/fonts/NotoSansArabic-Bold.ttf")),
+        (Path("/system/fonts/DroidSansArabic.ttf"),
+         Path("/system/fonts/DroidSansArabic.ttf")),
+    ]
+    for regular, bold in candidates:
+        if not regular.exists():
+            continue
+        bold_path = bold if bold.exists() else regular
+        try:
+            LabelBase.register(name=FONT, fn_regular=str(regular), fn_bold=str(bold_path))
+            LabelBase.register(name="Roboto", fn_regular=str(regular), fn_bold=str(bold_path))
+            return
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("font registration failed", exc)
+
+    LOG.warning("no usable bundled/system font; using Kivy default font")
+    default_regular = resource_find("data/fonts/Roboto-Regular.ttf")
+    default_bold = resource_find("data/fonts/Roboto-Bold.ttf") or default_regular
+    if default_regular:
+        LabelBase.register(name=FONT, fn_regular=default_regular, fn_bold=default_bold)
+      
+
+
 
 
 def T(en: str, ar: str) -> str:
