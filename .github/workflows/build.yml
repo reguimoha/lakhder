@@ -40,6 +40,10 @@ jobs:
       - name: Clean Old Buildozer Cache to Prevent Conflicts
         run: |
           rm -rf .buildozer/android/platform/android-ndk*
+          
+       - name: Clear Cache and Buildozer folders
+         run: |
+           rm -rf .buildozer bin
 
       - name: Build with Buildozer
         env:
