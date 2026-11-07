@@ -1,13 +1,13 @@
 [app]
 
 # (str) Title of your application
-title = Bochra AI
+title = Boshra AI
 
 # (str) Package name
-package.name = bochra
+package.name = boshra
 
 # (str) Package domain (reverse DNS)
-package.domain = org.bochra
+package.domain = org.boshra
 
 # (str) Source code where main.py is located
 source.dir = .
