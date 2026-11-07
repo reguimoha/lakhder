@@ -1,21 +1,14 @@
 name: Build Android APK
 
-
-       
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Clean Everything
-        run: |     
-          rm -rf .buildozer bin .old_buildozer
-
-
-    
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -28,31 +21,35 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 cmake libffi-dev \
-            libssl-dev gettext
+            git zip unzip openjdk-17-jdk python3-pip autoconf automake libtool \
+            libtool-bin pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
+            libtinfo6 cmake libffi-dev libltdl-dev libssl-dev gettext
 
       - name: Install Buildozer and Cython
         run: |
           pip install --upgrade pip
-          pip install --upgrade buildozer cython
+          pip install --upgrade buildozer "cython==0.29.36"
 
-      - name: Clean Old Buildozer Cache to Prevent Conflicts
+      - name: Clean old build state
         run: |
-          rm -rf .buildozer/android/platform/android-ndk*
-          
-       - name: Clear Cache and Buildozer folders
-         run: |
-           rm -rf .buildozer bin
+          rm -rf .buildozer bin
 
       - name: Build with Buildozer
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
-          ANDROID_NDK: /usr/local/lib/android/sdk/ndk/25.2.9519653
-          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
-          ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/25.2.9519653
         run: |
-          buildozer -v android debug
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Show error context
+        if: failure()
+        run: |
+          grep -n -B5 -A30 -E "Traceback|error:|No such file|Failed" build.log | head -200
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
