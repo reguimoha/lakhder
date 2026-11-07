@@ -142,25 +142,159 @@ ASSETS_PUBLIC_DIR = (
 )
 
 
-def asset_roots() -> List[Path]:
-    roots = [ASSETS_DIR]
-    if ASSETS_PUBLIC_DIR != ASSETS_DIR:
-        roots.insert(0, ASSETS_PUBLIC_DIR)
+def _kivy_user_data_dir() -> Optional[Path]:
+    """Kivy's per-app data directory, resolved lazily.
+
+    ``App.user_data_dir`` only exists after the App instance is built, so this
+    is queried at call time instead of being cached at import time. On Android
+    it points into the app's private storage, which is where Buildozer/p4a
+    extract bundled files and where downloads are kept.
+    """
+    if "kivy.app" not in sys.modules:
+        return None
+    try:
+        from kivy.app import App
+
+        running = App.get_running_app()
+        if running is not None:
+            value = getattr(running, "user_data_dir", "")
+            if value:
+                return Path(value).expanduser()
+    except Exception:  # noqa: BLE001 - App may be shutting down
+        pass
+    return None
+
+
+def _dedupe_paths(paths: Iterable[Path]) -> List[Path]:
+    """De-duplicate paths without requiring them to exist."""
+    unique: List[Path] = []
+    seen: set = set()
+    for raw in paths:
+        try:
+            path = Path(raw).expanduser()
+            key = os.path.normcase(str(path.resolve(strict=False)))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _saved_assets_root() -> Optional[Path]:
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        custom = saved.get("assets_path") if isinstance(saved, dict) else None
-        if isinstance(custom, str) and custom.strip():
-            root = Path(custom).expanduser()
-            roots = [root] + [path for path in roots if path != root]
     except (OSError, ValueError, TypeError):
-        pass
-    return roots
+        return None
+    if not isinstance(saved, dict):
+        return None
+    value = saved.get("assets_path")
+    if isinstance(value, str) and value.strip():
+        return Path(value).expanduser()
+    return None
+
+
+def asset_roots() -> List[Path]:
+    """Ordered asset roots for desktop and Android; never raises.
+
+    Desktop: the ``assets`` folder next to this script is preferred, so a
+    source checkout is self-contained. Kivy's user data directory and the
+    private data directory are searched as fallbacks.
+
+    Android (Buildozer/p4a): ``__file__`` lives in app-private storage where
+    bundled files are extracted, so the script-relative ``assets`` folder is
+    still valid. A user-visible ``/sdcard/assets`` folder is preferred when it
+    exists so models can be copied over USB without root; the Kivy user data
+    directory and ``ANDROID_PRIVATE`` cover installs that keep assets internal.
+
+    A saved ``assets_path`` from Settings and the ``BOSHRA_ASSETS`` environment
+    override are honoured first. Roots that do not exist yet are still
+    returned as safe creation targets, and filesystem errors are swallowed so
+    startup cannot fail with ``FileNotFoundError``.
+    """
+    candidates: List[Path] = []
+    override = _env_path("BOSHRA_ASSETS") or _env_path("BOSHRA_ASSETS_PATH")
+    if override:
+        candidates.append(override)
+
+    saved = _saved_assets_root()
+    if saved is not None:
+        candidates.append(saved)
+
+    user_data = _kivy_user_data_dir()
+    if IS_ANDROID:
+        # External storage, then packaged/app-private locations.
+        shared_assets = Path("/sdcard/assets")
+        if shared_assets.exists():
+            candidates.append(shared_assets)
+        android_public = _env_path("ANDROID_PUBLIC")
+        if android_public:
+            candidates.append(android_public / "assets")
+        candidates.append(ASSETS_DIR)
+        candidates.append(PRIVATE_DIR / "assets")
+        candidates.append(Path("/storage/emulated/0/BoshraAI/assets"))
+    else:
+        candidates.append(ASSETS_DIR)
+        try:
+            candidates.append(Path.cwd() / "assets")
+        except OSError:
+            pass
+        candidates.append(PUBLIC_DIR / "assets")
+        candidates.append(PRIVATE_DIR / "assets")
+    if user_data is not None:
+        candidates.append(user_data / "assets")
+
+    roots = _dedupe_paths(candidates)
+    return roots or [ASSETS_DIR]
+
+
+def _is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _asset_creation_roots() -> List[Path]:
+    """Only the roots where Boshra should actually create model folders.
+
+    ``asset_roots`` also lists read-only fallbacks for discovery; creating
+    folders in all of them would litter the home directory, so creation is
+    limited to an explicit user choice and the platform's normal storage.
+    """
+    candidates: List[Path] = []
+    override = _env_path("BOSHRA_ASSETS") or _env_path("BOSHRA_ASSETS_PATH")
+    if override:
+        candidates.append(override)
+    saved = _saved_assets_root()
+    if saved is not None:
+        candidates.append(saved)
+    if IS_ANDROID:
+        shared = Path("/sdcard/assets")
+        try:
+            if Path("/sdcard").is_dir():
+                candidates.append(shared)
+        except OSError:
+            pass
+        candidates.append(ASSETS_DIR)
+        candidates.append(PRIVATE_DIR / "assets")
+    else:
+        candidates.append(ASSETS_DIR)
+    return _dedupe_paths(candidates) or [ASSETS_DIR]
 
 
 def ensure_asset_dirs() -> Dict[str, Path]:
-    """Create the model folders the app scans, preferring /sdcard/assets on Android."""
+    """Create the model folders the app scans, preferring shared storage on Android."""
     created: Dict[str, Path] = {}
-    for root in asset_roots():
+    for root in _asset_creation_roots():
         for name in ASSET_NAMES:
             folder = root / name
             try:
@@ -358,6 +492,310 @@ def human_bytes(size: float) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} TB"
+
+
+# --------------------------------------------------------------------------
+# Asset inventory: cross-platform discovery and validation
+# --------------------------------------------------------------------------
+_ASSET_EXTRA_FOLDERS: Dict[str, Tuple[Path, ...]] = {
+    # Locations older builds and manual installs may still use.
+    "phi3": (
+        MODELS_DIR, PUBLIC_DIR / "models", Path("/sdcard/phi3"),
+        Path("/sdcard/BoshraAI/models"),
+    ),
+    "vosk-model-ar": (
+        PRIVATE_DIR / "vosk-model-ar", Path("/sdcard/BoshraAI/models/vosk-model-ar"),
+    ),
+    "vosk-model-en": (
+        PRIVATE_DIR / "vosk-model-en", Path("/sdcard/BoshraAI/models/vosk-model-en"),
+    ),
+    "piper-tts": (PRIVATE_DIR / "piper-tts", Path("/sdcard/assets/piper-tts")),
+    "fonts": (FONTS_DIR,),
+}
+
+_VOSK_MARKERS = ("am", "conf", "graph")
+_VOSK_KEY_FILES = (
+    ("am/final.mdl", ("am", "final.mdl")),
+    ("conf/model.conf", ("conf", "model.conf")),
+    ("conf/mfcc.conf", ("conf", "mfcc.conf")),
+    ("graph/HCLG.fst", ("graph", "HCLG.fst")),
+    ("graph/words.txt", ("graph", "words.txt")),
+)
+
+
+@dataclass
+class AssetStatus:
+    """One expected asset folder and what validation found there."""
+
+    key: str
+    label: str
+    path: Path
+    ok: bool = False
+    found: List[str] = field(default_factory=list)
+    missing: List[str] = field(default_factory=list)
+    detail: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "path": str(self.path),
+            "ok": self.ok,
+            "found": list(self.found),
+            "missing": list(self.missing),
+            "detail": self.detail,
+        }
+
+
+@dataclass
+class AssetReport:
+    """Complete validation report; safe to serialize or show in the UI."""
+
+    root: Path
+    roots: List[Path] = field(default_factory=list)
+    statuses: List[AssetStatus] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.statuses) and all(item.ok for item in self.statuses)
+
+    @property
+    def missing(self) -> List[str]:
+        return [item.key for item in self.statuses if not item.ok]
+
+    def status(self, key: str) -> Optional[AssetStatus]:
+        return next((item for item in self.statuses if item.key == key), None)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "root": str(self.root),
+            "roots": [str(path) for path in self.roots],
+            "missing": self.missing,
+            "error": self.error,
+            "assets": [item.as_dict() for item in self.statuses],
+        }
+
+
+def _asset_folders(
+    name: str, roots: Sequence[Path], include_extras: bool = True,
+) -> List[Path]:
+    candidates = [root / name for root in roots]
+    if include_extras:
+        candidates.extend(_ASSET_EXTRA_FOLDERS.get(name, ()))
+    return [folder for folder in _dedupe_paths(candidates) if _is_dir(folder)]
+
+
+def _scan_files(folder: Path, pattern: str, recursive: bool = False) -> List[Path]:
+    try:
+        iterator = folder.rglob(pattern) if recursive else folder.glob(pattern)
+        found = [path for path in iterator if _is_file(path)]
+    except (OSError, ValueError):
+        return []
+    return sorted(found, key=lambda path: str(path).lower())
+
+
+def _gguf_is_valid(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
+def _check_phi3(
+    key: str, label: str, roots: Sequence[Path], include_extras: bool = True,
+) -> AssetStatus:
+    folders = _asset_folders(key, roots, include_extras)
+    invalid: List[Path] = []
+    for folder in folders:
+        models = _dedupe_paths(
+            _scan_files(folder, "*.gguf") + _scan_files(folder, "*/*.gguf")
+        )
+        valid: List[Tuple[Path, int]] = []
+        for model in models:
+            if not _gguf_is_valid(model):
+                invalid.append(model)
+                continue
+            try:
+                size = model.stat().st_size
+            except OSError:
+                size = 0
+            valid.append((model, size))
+        if valid:
+            model, size = max(valid, key=lambda item: item[1])
+            return AssetStatus(
+                key, label, model.parent, True, [model.name], [],
+                f"{model.name} · {human_bytes(size)}",
+            )
+    if invalid:
+        return AssetStatus(
+            key, label, invalid[0].parent, False,
+            [model.name for model in invalid[:4]], ["valid GGUF header"],
+            f"invalid GGUF header: {invalid[0].name}",
+        )
+    if folders:
+        return AssetStatus(
+            key, label, folders[0], False, [], ["*.gguf"],
+            "folder found; no .gguf model",
+        )
+    return AssetStatus(
+        key, label, roots[0] / key, False, [], [f"{key} folder"], "folder not found",
+    )
+
+
+def _vosk_layout(folder: Path) -> Optional[Tuple[Path, List[str]]]:
+    candidates = [folder]
+    try:
+        candidates.extend(
+            sorted(
+                (child for child in folder.iterdir() if _is_dir(child)),
+                key=lambda child: child.name.lower(),
+            )[:8]
+        )
+    except OSError:
+        pass
+    for candidate in candidates:
+        dirs = {name: _is_dir(candidate / name) for name in _VOSK_MARKERS}
+        files = {
+            name: _is_file(candidate.joinpath(*parts))
+            for name, parts in _VOSK_KEY_FILES
+        }
+        if sum(dirs.values()) >= 2 or sum(files.values()) >= 2:
+            found = [f"{name}/" for name, present in dirs.items() if present]
+            found.extend(name for name, present in files.items() if present)
+            return candidate, found
+    return None
+
+
+def _check_vosk(
+    key: str, label: str, roots: Sequence[Path], include_extras: bool = True,
+) -> AssetStatus:
+    folders = _asset_folders(key, roots, include_extras)
+    for folder in folders:
+        layout = _vosk_layout(folder)
+        if layout is not None:
+            path, found = layout
+            return AssetStatus(key, label, path, True, found, [], ", ".join(found[:4]))
+    if folders:
+        folder = folders[0]
+        found = [f"{name}/" for name in _VOSK_MARKERS if _is_dir(folder / name)]
+        missing = [f"{name}/" for name in _VOSK_MARKERS if not _is_dir(folder / name)]
+        return AssetStatus(
+            key, label, folder, False, found, missing,
+            "incomplete Vosk model structure",
+        )
+    return AssetStatus(
+        key, label, roots[0] / key, False, [], [f"{key} folder"], "folder not found",
+    )
+
+
+def _piper_sidecar(voice: Path) -> Optional[Path]:
+    for config in (Path(f"{voice}.json"), voice.with_suffix(".json")):
+        if _is_file(config):
+            return config
+    return None
+
+
+def _check_piper(
+    key: str, label: str, roots: Sequence[Path], include_extras: bool = True,
+) -> AssetStatus:
+    folders = _asset_folders(key, roots, include_extras)
+    incomplete: Optional[Tuple[Path, List[Path]]] = None
+    for folder in folders:
+        voices = _scan_files(folder, "*.onnx", recursive=True)
+        if not voices:
+            continue
+        paired: List[Path] = []
+        unpaired: List[Path] = []
+        for voice in voices:
+            if _piper_sidecar(voice) is not None:
+                paired.append(voice)
+            else:
+                unpaired.append(voice)
+        if paired:
+            path = paired[0].parent
+            detail = f"{len(paired)} voice(s) with JSON config"
+            if unpaired:
+                detail += f"; {len(unpaired)} without config"
+            return AssetStatus(
+                key, label, path, True, [voice.name for voice in paired],
+                [f"{voice.name}.json" for voice in unpaired], detail,
+            )
+        if incomplete is None:
+            incomplete = (voices[0].parent, voices)
+    if incomplete is not None:
+        path, voices = incomplete
+        return AssetStatus(
+            key, label, path, False, [voice.name for voice in voices],
+            [f"{voice.name}.json" for voice in voices], "missing Piper voice config",
+        )
+    if folders:
+        return AssetStatus(
+            key, label, folders[0], False, [], ["*.onnx"],
+            "folder found; no .onnx voice",
+        )
+    return AssetStatus(
+        key, label, roots[0] / key, False, [], [f"{key} folder"], "folder not found",
+    )
+
+
+def _check_fonts(
+    key: str, label: str, roots: Sequence[Path], include_extras: bool = True,
+) -> AssetStatus:
+    folders = _asset_folders(key, roots, include_extras)
+    for folder in folders:
+        fonts = _scan_files(folder, "*.ttf") + _scan_files(folder, "*.ttc")
+        if fonts:
+            names = [font.name for font in fonts]
+            return AssetStatus(
+                key, label, folder, True, names, [],
+                f"{len(names)} font file(s)",
+            )
+    if folders:
+        return AssetStatus(
+            key, label, folders[0], False, [], ["*.ttf"],
+            "folder found; no TrueType font",
+        )
+    return AssetStatus(
+        key, label, roots[0] / key, False, [], ["fonts folder"], "folder not found",
+    )
+
+
+_ASSET_SPECS = (
+    ("phi3", "Phi-3 GGUF", _check_phi3),
+    ("vosk-model-ar", "Vosk Arabic", _check_vosk),
+    ("vosk-model-en", "Vosk English", _check_vosk),
+    ("piper-tts", "Piper TTS", _check_piper),
+    ("fonts", "Fonts", _check_fonts),
+)
+
+
+def inspect_assets(root: Optional[Path] = None) -> AssetReport:
+    """Validate every expected asset folder without ever raising.
+
+    Pass ``root`` to audit a specific assets directory (used by tests and the
+    Models screen); otherwise every platform candidate from ``asset_roots()``
+    is searched so a working folder cannot be masked by a stale config path.
+    """
+    try:
+        roots = _dedupe_paths([root]) if root is not None else asset_roots()
+    except (OSError, TypeError, ValueError):
+        roots = [ASSETS_DIR]
+    roots = roots or [ASSETS_DIR]
+    primary = next((path for path in roots if _is_dir(path)), roots[0])
+    statuses: List[AssetStatus] = []
+    for key, label, checker in _ASSET_SPECS:
+        try:
+            status = checker(key, label, roots, root is None)
+        except Exception as exc:  # noqa: BLE001 - validation must never crash
+            status = AssetStatus(
+                key, label, primary / key, False, [], ["check error"],
+                f"check failed: {type(exc).__name__}: {exc}",
+            )
+        statuses.append(status)
+    return AssetReport(root=primary, roots=roots, statuses=statuses)
 
 
 # --------------------------------------------------------------------------
@@ -12356,48 +12794,29 @@ def download_model_asset(url: str, category: str,
     }
 
 
-def build_asset_status(core: Any) -> List[Dict[str, Any]]:
-    folders = ensure_asset_dirs()
-    models = core.models.scan()
-    vosk = discover_vosk_models()
-    voices: List[Dict[str, Any]] = []
-    with contextlib.suppress(Exception):
-        voices = core.tts.piperian.list_voices()
-    phi_root = Path(folders.get("phi3", "")).resolve() if folders.get("phi3") else None
-    phi_models = []
-    if phi_root is not None:
-        for model in models:
-            with contextlib.suppress(Exception):
-                if phi_root in Path(model.path).resolve().parents:
-                    phi_models.append(model)
-    phi_detail = (
-        f"{phi_models[0].name} · {human_bytes(phi_models[0].size)}" if phi_models
-        else T("no .gguf file in this folder", "لا يوجد ملف gguf في هذا المجلد")
-    )
-    return [
-        {
-            "key": "phi3", "label": "Phi-3 GGUF", "ok": bool(phi_models),
-            "detail": phi_detail, "path": str(folders.get("phi3", "")),
-        },
-        {
-            "key": "vosk-model-ar", "label": "Vosk AR", "ok": "ar" in vosk,
-            "detail": (T("Arabic speech model found", "نموذج الكلام العربي موجود")
-                       if "ar" in vosk else T("speech model missing", "نموذج الكلام مفقود")),
-            "path": str(folders.get("vosk-model-ar", "")),
-        },
-        {
-            "key": "vosk-model-en", "label": "Vosk EN", "ok": "en" in vosk,
-            "detail": (T("English speech model found", "نموذج الكلام الإنجليزي موجود")
-                       if "en" in vosk else T("speech model missing", "نموذج الكلام مفقود")),
-            "path": str(folders.get("vosk-model-en", "")),
-        },
-        {
-            "key": "piper-tts", "label": "Piper TTS", "ok": bool(voices),
-            "detail": (f"{len(voices)} " + T("voice(s) found", "صوت موجود")) if voices
-                      else T("no .onnx voice found", "لا يوجد صوت .onnx"),
-            "path": str(folders.get("piper-tts", "")),
-        },
-    ]
+def build_asset_status(_core: Any) -> List[Dict[str, Any]]:
+    """Localized UI rows backed by :func:`inspect_assets` (never raises)."""
+    labels = {
+        "phi3": T("Phi-3 GGUF", "Phi-3 GGUF"),
+        "vosk-model-ar": T("Vosk Arabic", "Vosk العربية"),
+        "vosk-model-en": T("Vosk English", "Vosk الإنجليزية"),
+        "piper-tts": T("Piper TTS", "Piper TTS"),
+        "fonts": T("Fonts", "الخطوط"),
+    }
+    try:
+        report = inspect_assets()
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(f"asset report failed: {exc}")
+        return []
+    rows: List[Dict[str, Any]] = []
+    for status in report.statuses:
+        row = status.as_dict()
+        row["label"] = labels.get(status.key, status.label)
+        if not status.ok and status.missing:
+            missing = ", ".join(status.missing)
+            row["detail"] = T(f"missing: {missing}", f"مفقود: {missing}")
+        rows.append(row)
+    return rows
 
 
 class ModelsScreen(ScreenBase):
@@ -12475,18 +12894,19 @@ class ModelsScreen(ScreenBase):
             panel.bind(minimum_height=panel.setter("height"))
             head = BoxLayout(size_hint_y=None, height=dp(22), spacing=dp(3))
             head.add_widget(_label(
-                ("● " if entry["ok"] else "● ") + entry["label"],
+                ("● " if entry["ok"] else "○ ") + entry["label"],
                 self.palette, 9.0, "good" if entry["ok"] else "danger", bold=True,
             ))
-            download = NeonButton(
-                self.palette, text=T("Download", "تنزيل"), size_hint=(None, 1),
-                width=dp(56), font_size=sp(7.2),
-            )
-            download.bind(
-                on_release=lambda *_args, key=entry["key"], name=entry["label"]:
-                self.app.ui_guard(lambda: self.ask_download(key, name))
-            )
-            head.add_widget(download)
+            if entry["key"] in ASSET_NAMES:
+                download = NeonButton(
+                    self.palette, text=T("Download", "تنزيل"), size_hint=(None, 1),
+                    width=dp(56), font_size=sp(7.2),
+                )
+                download.bind(
+                    on_release=lambda *_args, key=entry["key"], name=entry["label"]:
+                    self.app.ui_guard(lambda: self.ask_download(key, name))
+                )
+                head.add_widget(download)
             panel.add_widget(head)
             panel.add_widget(_label(str(entry["detail"]), self.palette, 7.8, "dim"))
             panel.add_widget(_label(str(entry["path"]), self.palette, 7.0, "dim", shorten=True))
@@ -13132,11 +13552,12 @@ class SettingsScreen(ScreenBase):
                          "good" if row["ok"] else "danger", size_hint=(None, 1), width=dp(15))
             panel.add_widget(dot)
             panel.add_widget(_label(row["label"], self.palette, 8.8, "text", size_hint_y=1))
-            get_btn = NeonButton(self.palette, text=T1("Download", "تنزيل"),
-                                 size_hint=(None, 1), width=dp(64), font_size=sp(8))
-            get_btn.bind(on_release=lambda *_a, key=row["key"], label=row["label"]:
-                         self.download_asset(key, label))
-            panel.add_widget(get_btn)
+            if row["key"] in ASSET_NAMES:
+                get_btn = NeonButton(self.palette, text=T1("Download", "تنزيل"),
+                                     size_hint=(None, 1), width=dp(64), font_size=sp(8))
+                get_btn.bind(on_release=lambda *_a, key=row["key"], label=row["label"]:
+                             self.download_asset(key, label))
+                panel.add_widget(get_btn)
             self.box.add_widget(panel)
             self.asset_dots[row["key"]] = dot
         folder = self.core.config.assets_path or str(ASSETS_DIR)
@@ -15028,6 +15449,18 @@ def run_self_tests() -> int:
         record("emergency-guide", bool(emergency.get("text")))
         record("diagnostics", bool(core.diagnostics.run_all()))
         record("tts-status", bool(core.tts.status))
+        asset_report = inspect_assets()
+        record(
+            "asset-report",
+            len(asset_report.statuses) == len(_ASSET_SPECS)
+            and isinstance(asset_report.as_dict().get("assets"), list),
+            f"missing={','.join(asset_report.missing) or 'none'}",
+        )
+        empty_report = inspect_assets(PRIVATE_DIR / "missing-assets-probe")
+        record(
+            "asset-report-missing",
+            not empty_report.ok and len(empty_report.statuses) == len(_ASSET_SPECS),
+        )
         sound_ready = core.ui_sound.warm_up()
         record("ui-sound-generate", sound_ready, core.ui_sound.last_error)
         try:
