@@ -81,4 +81,3 @@ log_level = 2
 
 # (int) warn when running as root
 warn_on_root = 1
-
