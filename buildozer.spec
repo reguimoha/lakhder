@@ -67,7 +67,7 @@ android.enable_androidx = True
 android.permissions = INTERNET, RECORD_AUDIO, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, SYSTEM_ALERT_WINDOW, VIBRATE, ACCESS_NETWORK_STATE, WAKE_LOCK, POST_NOTIFICATIONS
 
 # Extra manifest XML (accessibility <service> entry goes here). File must exist.
-android.extra_manifest_xml = android_extras.xml
+# android.extra_manifest_xml = android_extras.xml
 
 # Java sources (e.g. your AccessibilityService class). Folder must exist.
 android.add_src = src
