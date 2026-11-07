@@ -36,14 +36,15 @@ fullscreen = 1
 
 # (list) Python/p4a requirements
 # llama-cpp-python needs a working recipe at ./recipes/llama-cpp-python/__init__.py
-requirements = python3,hostpython3,kivy==2.3.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3,idna,certifi,charset-normalizer,psutil,pypdf,pillow,arabic_reshaper,python-bidi,numpy
+
+requirements = python3,kivy==2.3.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3<2,idna,certifi,charset-normalizer==2.1.1,pypdf==4.2.0,pillow,arabic_reshaper,python-bidi==0.4.2,numpy
 #llama-cpp-python==0.3.16
 
 # Local recipes folder (cross-compiles the inference engine for Android)
 # p4a.local_recipes = ./recipes
 
 # python-for-android branch (develop is needed for custom CMake recipes on recent NDKs)
-p4a.branch = develop
+p4a.branch = master
 
 # (str) p4a bootstrap
 p4a.bootstrap = sdl2
