@@ -3726,25 +3726,27 @@ class SpeechEngine:
 
     def _choose_backend(self) -> SpeechBackend:
         preference = getattr(self.config, "tts_voice", "auto")
-        candidates: List[SpeechBackend] = []
+        wanted: List[SpeechBackend] = []
         if preference == "piper":
-            candidates.append(self.piperian)
-        if preference == "android":
-            candidates.append(self.android)
-        if preference == "desktop" and self.desktop:
-            candidates.append(self.desktop)
-        if preference == "auto":
-            candidates = [self.piperian, self.android]
-            if self.desktop:
-                candidates.append(self.desktop)
-        for candidate in candidates:
+            wanted.append(self.piperian)
+        elif preference == "android":
+            wanted.append(self.android)
+        elif preference == "desktop" and self.desktop:
+            wanted.append(self.desktop)
+        # "auto" and unknown values begin with the richest backend.
+        wanted.extend([self.piperian, self.android, self.desktop])
+
+        ordered: List[SpeechBackend] = []
+        for candidate in wanted:
+            if candidate and candidate not in ordered:
+                ordered.append(candidate)
+        for candidate in ordered:
             if candidate.available:
+                if candidate is not ordered[0]:
+                    LOG.info(f"tts: {ordered[0].name} unavailable, using {candidate.name}")
                 return candidate
         # even when inactive, keep a backend object so status is truthful
-        for candidate in candidates:
-            if isinstance(candidate, SpeechBackend):
-                return candidate
-        return SpeechBackend()
+        return ordered[0] if ordered else SpeechBackend()
 
     @property
     def status(self) -> str:
@@ -9372,38 +9374,89 @@ PALETTES: Dict[str, Dict[str, str]] = {
 }
 
 
+def _font_pairs() -> Iterator[Tuple[Path, Optional[Path]]]:
+    """Yield usable (regular, bold-or-None) font pairs in preference order.
 
-def register_fonts() -> None:
-    from kivy.resources import resource_find
-
-    candidates = [
-        (FONTS_DIR / "DejaVuSans.ttf", FONTS_DIR / "DejaVuSans-Bold.ttf"),
-        (Path("/system/fonts/NotoNaskhArabic-Regular.ttf"),
-         Path("/system/fonts/NotoNaskhArabic-Bold.ttf")),
+    Bundled assets win, then Android system fonts, then the font shipped with
+    Kivy. Every candidate is checked before use, so a missing ``.ttf`` can
+    never reach ``LabelBase.register``.
+    """
+    pairs: List[Tuple[Path, Path]] = []
+    try:
+        font_folders = _asset_folders("fonts", asset_roots())
+    except Exception:  # noqa: BLE001 - asset discovery must not block startup
+        font_folders = []
+    if FONTS_DIR not in font_folders:
+        font_folders.insert(0, FONTS_DIR)
+    for folder in font_folders:
+        pairs.append((folder / "DejaVuSans.ttf", folder / "DejaVuSans-Bold.ttf"))
+        pairs.append((folder / "Boshra.ttf", folder / "Boshra-Bold.ttf"))
+        for font in _scan_files(folder, "*.ttf")[:4]:
+            pairs.append((font, font.with_name(f"{font.stem}-Bold.ttf")))
+    pairs.extend([
         (Path("/system/fonts/NotoSansArabic-Regular.ttf"),
          Path("/system/fonts/NotoSansArabic-Bold.ttf")),
         (Path("/system/fonts/DroidSansArabic.ttf"),
-         Path("/system/fonts/DroidSansArabic.ttf")),
-    ]
-    for regular, bold in candidates:
-        if not regular.exists():
+         Path("/system/fonts/DroidSansArabic-Bold.ttf")),
+        (Path("/system/fonts/Roboto-Regular.ttf"), Path("/system/fonts/Roboto-Bold.ttf")),
+        (Path("/system/fonts/DroidSans.ttf"), Path("/system/fonts/DroidSans-Bold.ttf")),
+        (Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")),
+    ])
+    try:
+        import kivy
+
+        kivy_fonts = Path(kivy.__file__).resolve().parent / "data" / "fonts"
+        pairs.append((kivy_fonts / "Roboto-Regular.ttf", kivy_fonts / "Roboto-Bold.ttf"))
+    except Exception:  # noqa: BLE001 - Kivy is present in practice
+        pass
+    seen: set = set()
+    for regular, bold in pairs:
+        if not _is_file(regular):
             continue
-        bold_path = bold if bold.exists() else regular
-        try:
-            LabelBase.register(name=FONT, fn_regular=str(regular), fn_bold=str(bold_path))
-            LabelBase.register(name="Roboto", fn_regular=str(regular), fn_bold=str(bold_path))
-            return
-        except Exception as exc:  # noqa: BLE001
-            LOG.error("font registration failed", exc)
-
-    LOG.warning("no usable bundled/system font; using Kivy default font")
-    default_regular = resource_find("data/fonts/Roboto-Regular.ttf")
-    default_bold = resource_find("data/fonts/Roboto-Bold.ttf") or default_regular
-    if default_regular:
-        LabelBase.register(name=FONT, fn_regular=default_regular, fn_bold=default_bold)
-      
+        key = str(regular)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield regular, bold if _is_file(bold) else None
 
 
+def register_fonts() -> None:
+    """Register the UI font, always leaving ``FONT`` bound to a usable family.
+
+    The previous version returned early when the bundled font was absent, but
+    widgets still requested the custom family, producing
+    ``Label: File 'Boshra.ttf' not found``. Now the family is only advertised
+    after a real file was registered; otherwise ``FONT`` switches to Kivy's
+    built-in Roboto.
+    """
+    global FONT
+    family = "Boshra"
+    pair = next(_font_pairs(), None)
+    if pair is None:
+        FONT = "Roboto"
+        LOG.warning("no usable font file found; using Kivy's built-in Roboto")
+        return
+    regular, bold = pair
+    try:
+        LabelBase.register(
+            name=family,
+            fn_regular=str(regular),
+            fn_bold=str(bold or regular),
+        )
+        FONT = family
+    except Exception as exc:  # noqa: BLE001
+        FONT = "Roboto"
+        LOG.error("custom font registration failed; using Kivy Roboto", exc)
+        return
+    with contextlib.suppress(Exception):
+        # Keep Kivy's default family consistent with the selected font.
+        LabelBase.register(
+            name="Roboto",
+            fn_regular=str(regular),
+            fn_bold=str(bold or regular),
+        )
+    LOG.info(f"UI font: {regular}")
 
 
 def T(en: str, ar: str) -> str:
@@ -12806,7 +12859,7 @@ def download_model_asset(url: str, category: str,
     }
 
 
-def build_asset_status(_core: Any) -> List[Dict[str, Any]]:
+def build_asset_status(_core: Any = None, report: Optional[AssetReport] = None) -> List[Dict[str, Any]]:
     """Localized UI rows backed by :func:`inspect_assets` (never raises)."""
     labels = {
         "phi3": T("Phi-3 GGUF", "Phi-3 GGUF"),
@@ -12815,11 +12868,12 @@ def build_asset_status(_core: Any) -> List[Dict[str, Any]]:
         "piper-tts": T("Piper TTS", "Piper TTS"),
         "fonts": T("Fonts", "الخطوط"),
     }
-    try:
-        report = inspect_assets()
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning(f"asset report failed: {exc}")
-        return []
+    if report is None:
+        try:
+            report = inspect_assets()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"asset report failed: {exc}")
+            return []
     rows: List[Dict[str, Any]] = []
     for status in report.statuses:
         row = status.as_dict()
@@ -14120,6 +14174,11 @@ class BoshraApp(App):
 
     def build(self) -> Any:
         register_fonts()
+        # Validate bundled assets before any screen is composed. Every failure
+        # path keeps the UI on Kivy/system defaults instead of raising.
+        self._startup_report: Optional[AssetReport] = None
+        self._asset_capabilities: Dict[str, bool] = {}
+        self._startup_asset_guard()
         Window.softinput_mode = "resize"
         if IS_ANDROID:
             with contextlib.suppress(Exception):
@@ -14171,6 +14230,38 @@ class BoshraApp(App):
             Window.bind(on_keyboard=self._on_keyboard)
         Clock.schedule_once(self._after_start, 0.15)
         return self._root
+
+    def _startup_asset_guard(self) -> None:
+        """One defensive scan at launch; never blocks or crashes the UI.
+
+        Missing folders are simply skipped: the chat, voice and font layers
+        each fall back to Android/Kivy defaults on their own.
+        """
+        started = time.monotonic()
+        try:
+            folders = ensure_asset_dirs()
+        except Exception as exc:  # noqa: BLE001 - launch must survive
+            LOG.warning(f"asset folder creation skipped: {exc}")
+            folders = {}
+        try:
+            report = inspect_assets()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"asset scan skipped: {exc}")
+            report = None
+        self._startup_report = report
+        if report is None:
+            return
+        self._asset_capabilities = {row.key: bool(row.ok) for row in report.statuses}
+        missing = [row.key for row in report.statuses if not row.ok]
+        elapsed = (time.monotonic() - started) * 1000
+        LOG.info(
+            f"asset scan {elapsed:.0f} ms · root={report.root} · "
+            + ("all present" if not missing else "missing " + ", ".join(missing))
+        )
+        for key in missing:
+            entry = folders.get(key)
+            LOG.warning(f"asset '{key}' unavailable; using system fallback"
+                        + (f" (expected in {entry})" if entry else ""))
 
     # -- composition -----------------------------------------------------
     def _compose(self) -> None:
@@ -14416,11 +14507,11 @@ class BoshraApp(App):
             root = folders.get("phi3").parent if folders.get("phi3") else ASSETS_DIR
             if not self.core.config.assets_path:
                 self.core.config.set("assets_path", str(root))
-            rows = build_asset_status(self.core)
+            rows = build_asset_status(self.core, getattr(self, "_startup_report", None))
         except Exception as exc:  # noqa: BLE001
             LOG.warning(f"asset scan failed: {exc}")
             return
-        if all(row["ok"] for row in rows):
+        if not rows or all(row["ok"] for row in rows):
             return
         modal = BoshraModal(self, T("Model folders", "مجلدات النماذج"), self.palette,
                             height=min(Window.height * 0.70, dp(560)))
