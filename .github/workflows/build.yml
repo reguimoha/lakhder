@@ -12,6 +12,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Check fonts exist
+        run: |
+          ls -la assets/fonts || echo "MISSING assets/fonts"
+          test -f assets/fonts/DejaVuSans.ttf && echo "font OK" || (echo "font MISSING"; exit 1)
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -56,3 +61,6 @@ jobs:
         with:
           name: package
           path: bin/*.apk
+
+      - name: Check fonts were packaged
+        run: find .buildozer/android/app -name "*.ttf"
