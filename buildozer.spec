@@ -24,7 +24,7 @@ version = 0.1
 android.version_code = 1
 
 # (str) Icon and presplash - remove these two lines if you don't have the files
-icon.filename = assets/icon.png
+icon.filename = icon.png
 presplash.filename = presplash.png
 android.presplash_color = #000000
 
