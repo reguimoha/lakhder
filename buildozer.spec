@@ -24,9 +24,9 @@ version = 0.1
 android.version_code = 1
 
 # (str) Icon and presplash - remove these two lines if you don't have the files
-# icon.filename = assets/icon.png
-# presplash.filename = presplash.png
-# android.presplash_color = #000000
+icon.filename = assets/icon.png
+presplash.filename = presplash.png
+android.presplash_color = #000000
 
 # (str) Supported orientation
 orientation = portrait
@@ -37,10 +37,10 @@ fullscreen = 1
 # (list) Python/p4a requirements
 # llama-cpp-python needs a working recipe at ./recipes/llama-cpp-python/__init__.py
 
-requirements = python3,hostpython3,kivy==2.3.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3==1.26.18,idna,certifi,charset-normalizer==2.1.1,pypdf,pillow,arabic_reshaper,python-bidi==0.4.2
+requirements = python3,hostpython3,kivy==2.1.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3==1.26.18,idna,certifi,charset-normalizer==2.1.1,pypdf,pillow,arabic_reshaper,python-bidi==0.4.2
 
 # Local recipes folder (cross-compiles the inference engine for Android)
-# p4a.local_recipes = ./recipes
+p4a.local_recipes = ./recipes
 
 # python-for-android branch (develop is needed for custom CMake recipes on recent NDKs)
 p4a.branch = master
@@ -52,9 +52,9 @@ p4a.bootstrap = sdl2
 android.archs = arm64-v8a
 
 # Android API levels / NDK
-android.api = 34
+android.api = 33
 android.minapi = 24
-android.ndk =25b
+android.ndk = 25b
 
 # Accept SDK licenses automatically (required for non-interactive builds)
 android.accept_sdk_license = True
@@ -66,10 +66,10 @@ android.enable_androidx = True
 android.permissions = INTERNET, RECORD_AUDIO, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, SYSTEM_ALERT_WINDOW, VIBRATE, ACCESS_NETWORK_STATE, WAKE_LOCK, POST_NOTIFICATIONS
 
 # Extra manifest XML (accessibility <service> entry goes here). File must exist.
-# android.extra_manifest_xml = android_extras.xml
+android.extra_manifest_xml = android_extras.xml
 
 # Java sources (e.g. your AccessibilityService class). Folder must exist.
-# android.add_src = src
+android.add_src = src
 
 # Background service: uncomment once service.py exists next to main.py
 # services = Assistant:service.py:foreground
@@ -81,3 +81,4 @@ log_level = 2
 
 # (int) warn when running as root
 warn_on_root = 1
+
