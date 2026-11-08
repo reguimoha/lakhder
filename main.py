@@ -44,6 +44,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import shutil
 import sqlite3
@@ -290,10 +291,10 @@ def _asset_creation_roots() -> List[Path]:
 
 
 def ensure_asset_dirs() -> Dict[str, Path]:
-    """Create the model folders the app scans, preferring shared storage on Android."""
+    """Create the asset folders the app scans, preferring shared storage on Android."""
     created: Dict[str, Path] = {}
     for root in _asset_creation_roots():
-        for name in ASSET_NAMES:
+        for name in (*ASSET_NAMES, "fonts"):
             folder = root / name
             try:
                 folder.mkdir(parents=True, exist_ok=True)
@@ -503,13 +504,86 @@ _ASSET_EXTRA_FOLDERS: Dict[str, Tuple[Path, ...]] = {
     ),
     "vosk-model-ar": (
         PRIVATE_DIR / "vosk-model-ar", Path("/sdcard/BoshraAI/models/vosk-model-ar"),
+        Path("/sdcard/vosk-ar"), Path("/sdcard/vosk-model-ar"),
+        Path("/storage/emulated/0/vosk-ar"),
     ),
     "vosk-model-en": (
         PRIVATE_DIR / "vosk-model-en", Path("/sdcard/BoshraAI/models/vosk-model-en"),
+        Path("/sdcard/vosk-en"), Path("/sdcard/vosk-model-en"),
+        Path("/storage/emulated/0/vosk-en"),
     ),
-    "piper-tts": (PRIVATE_DIR / "piper-tts", Path("/sdcard/assets/piper-tts")),
-    "fonts": (FONTS_DIR,),
+    "piper-tts": (
+        PRIVATE_DIR / "piper-tts", Path("/sdcard/assets/piper-tts"),
+        Path("/sdcard/piper-tts"), Path("/storage/emulated/0/piper-tts"),
+    ),
+    "fonts": (FONTS_DIR, Path("/sdcard/fonts")),
 }
+
+# Users drop folders under many names ("vosk-ar" is the common one), so every
+# component accepts short aliases. Matching is case-insensitive and tolerates
+# version suffixes such as ``vosk-model-ar-0.22``.
+_ASSET_FOLDER_ALIASES = {
+    "phi3": ("phi3", "phi-3", "phi_3"),
+    "vosk-model-ar": ("vosk-model-ar", "vosk-ar", "vosk_ar", "vosk_model_ar"),
+    "vosk-model-en": ("vosk-model-en", "vosk-en", "vosk_en", "vosk_model_en"),
+    "piper-tts": ("piper-tts", "piper", "piper_tts", "voices"),
+    "fonts": ("fonts", "font"),
+}
+
+
+def _folder_matches(name: str, aliases: Sequence[str], key: str) -> bool:
+    """True when a directory name is an alias of an expected asset folder."""
+    low = name.lower().strip()
+    for alias in aliases:
+        alias_low = alias.lower()
+        if low == alias_low:
+            return True
+        if low.startswith(alias_low + "-") or low.startswith(alias_low + "_"):
+            return True
+    if key.startswith("vosk-"):
+        # e.g. vosk-model-small-ar-0.22: accept only the requested language.
+        if "vosk" not in low:
+            return False
+        lang = key.rsplit("-", 1)[-1]
+        tokens = {token for token in re.split(r"[^a-z]+", low) if token}
+        if lang in tokens:
+            return True
+        return lang == "ar" and "arabic" in tokens
+    return False
+
+
+def _iter_dirs(folder: Path, max_depth: int = 3) -> Iterable[Path]:
+    """Yield ``folder`` and descendants, stopping at ``max_depth`` levels."""
+    base = len(folder.parts)
+    try:
+        for current, subdirs, _files in os.walk(folder):
+            path = Path(current)
+            subdirs.sort(key=str.lower)
+            if len(path.parts) - base >= max_depth:
+                subdirs[:] = []
+            yield path
+    except OSError:
+        return
+
+
+def _files_with_suffix(folder: Path, suffix: str, max_depth: int = 3) -> List[Path]:
+    """Case-insensitive file search inside a folder, depth-limited."""
+    wanted = suffix.lower()
+    found: List[Path] = []
+    for directory in _iter_dirs(folder, max_depth):
+        try:
+            entries = sorted(directory.iterdir(), key=lambda child: child.name.lower())
+        except OSError:
+            continue
+        for entry in entries:
+            if _is_file(entry) and entry.suffix.lower() == wanted:
+                found.append(entry)
+    return found
+
+
+def _gguf_in_tree(folder: Path, max_depth: int = 3) -> List[Path]:
+    return _files_with_suffix(folder, ".gguf", max_depth)
+
 
 _VOSK_MARKERS = ("am", "conf", "graph")
 _VOSK_KEY_FILES = (
@@ -579,19 +653,27 @@ class AssetReport:
 def _asset_folders(
     name: str, roots: Sequence[Path], include_extras: bool = True,
 ) -> List[Path]:
-    candidates = [root / name for root in roots]
+    aliases = _ASSET_FOLDER_ALIASES.get(name, (name,))
+    candidates: List[Path] = []
+    for root in roots:
+        for alias in aliases:
+            candidates.append(root / alias)
+        if not _is_dir(root):
+            continue
+        try:
+            children = sorted(root.iterdir(), key=lambda child: child.name.lower())
+        except OSError:
+            continue
+        for child in children:
+            if _is_dir(child) and _folder_matches(child.name, aliases, name):
+                candidates.append(child)
     if include_extras:
-        candidates.extend(_ASSET_EXTRA_FOLDERS.get(name, ()))
+        extras = list(_ASSET_EXTRA_FOLDERS.get(name, ()))
+        candidates.extend(extras)
+        for extra in extras:
+            for alias in aliases:
+                candidates.append(extra.parent / alias)
     return [folder for folder in _dedupe_paths(candidates) if _is_dir(folder)]
-
-
-def _scan_files(folder: Path, pattern: str, recursive: bool = False) -> List[Path]:
-    try:
-        iterator = folder.rglob(pattern) if recursive else folder.glob(pattern)
-        found = [path for path in iterator if _is_file(path)]
-    except (OSError, ValueError):
-        return []
-    return sorted(found, key=lambda path: str(path).lower())
 
 
 def _gguf_is_valid(path: Path) -> bool:
@@ -608,9 +690,7 @@ def _check_phi3(
     folders = _asset_folders(key, roots, include_extras)
     invalid: List[Path] = []
     for folder in folders:
-        models = _dedupe_paths(
-            _scan_files(folder, "*.gguf") + _scan_files(folder, "*/*.gguf")
-        )
+        models = _gguf_in_tree(folder, 3)
         valid: List[Tuple[Path, int]] = []
         for model in models:
             if not _gguf_is_valid(model):
@@ -644,17 +724,7 @@ def _check_phi3(
 
 
 def _vosk_layout(folder: Path) -> Optional[Tuple[Path, List[str]]]:
-    candidates = [folder]
-    try:
-        candidates.extend(
-            sorted(
-                (child for child in folder.iterdir() if _is_dir(child)),
-                key=lambda child: child.name.lower(),
-            )[:8]
-        )
-    except OSError:
-        pass
-    for candidate in candidates:
+    for candidate in _iter_dirs(folder, 3):
         dirs = {name: _is_dir(candidate / name) for name in _VOSK_MARKERS}
         files = {
             name: _is_file(candidate.joinpath(*parts))
@@ -702,7 +772,7 @@ def _check_piper(
     folders = _asset_folders(key, roots, include_extras)
     incomplete: Optional[Tuple[Path, List[Path]]] = None
     for folder in folders:
-        voices = _scan_files(folder, "*.onnx", recursive=True)
+        voices = _files_with_suffix(folder, ".onnx", 4)
         if not voices:
             continue
         paired: List[Path] = []
@@ -744,7 +814,10 @@ def _check_fonts(
 ) -> AssetStatus:
     folders = _asset_folders(key, roots, include_extras)
     for folder in folders:
-        fonts = _scan_files(folder, "*.ttf") + _scan_files(folder, "*.ttc")
+        fonts: List[Path] = []
+        for extension in (".ttf", ".otf", ".ttc"):
+            fonts.extend(_files_with_suffix(folder, extension, 3))
+        fonts = _dedupe_paths(fonts)
         if fonts:
             names = [font.name for font in fonts]
             return AssetStatus(
@@ -753,8 +826,8 @@ def _check_fonts(
             )
     if folders:
         return AssetStatus(
-            key, label, folders[0], False, [], ["*.ttf"],
-            "folder found; no TrueType font",
+            key, label, folders[0], False, [], ["*.ttf / *.otf"],
+            "folder found; no supported font",
         )
     return AssetStatus(
         key, label, roots[0] / key, False, [], ["fonts folder"], "folder not found",
@@ -1076,11 +1149,18 @@ def bilingual(en: str, ar: str) -> str:
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-VALID_THEMES = ("aurora", "matrix", "neon", "lava", "darkblue", "minimal", "glass")
+VALID_THEMES = (
+    "aurora", "matrix", "neon", "lava", "darkblue", "minimal", "glass",
+    "frost", "cosmos", "cyber", "obsidian", "daylight",
+)
 VALID_PROFILES = ("LITE", "BALANCED", "PERFORMANCE")
 VALID_MODES = ("local", "online", "auto")
 VALID_BUTTON_STYLES = ("glass", "rounded", "pill")
-VALID_SPHERE_STYLES = ("liquid", "particles", "plasma")
+VALID_SPHERE_STYLES = (
+    "liquid", "particles", "plasma", "nebula", "crystal", "pulse", "hologram",
+    "singularity", "dna", "quantum", "flame", "vortex", "jellyfish", "neural",
+    "eye", "galaxy", "atom", "heartbeat", "soundwave", "shield",
+)
 VALID_SPHERE_COLORS = ("cyan", "magenta", "gold", "green", "violet")
 # The living sphere is an independent visual layer: its colours never follow
 # the interface theme, so a theme switch cannot repaint the ball.
@@ -1103,11 +1183,40 @@ def sphere_rgb_int(rgb: Sequence[float]) -> int:
     return (r << 16) | (g << 8) | b
 
 
+SHADER_SPHERE_STYLES = ("liquid", "particles", "plasma")
+# The Android overlay bubble only animates three modes, so every extended
+# in-app style maps onto the closest one when it is mirrored to the overlay.
+SPHERE_STYLE_OVERLAY = {
+    "liquid": "liquid", "particles": "particles", "plasma": "plasma",
+    "nebula": "liquid", "crystal": "plasma", "pulse": "plasma",
+    "hologram": "plasma", "singularity": "plasma", "dna": "particles",
+    "quantum": "particles", "flame": "liquid", "vortex": "liquid",
+    "jellyfish": "liquid", "neural": "particles", "eye": "liquid",
+    "galaxy": "particles", "atom": "particles", "heartbeat": "plasma",
+    "soundwave": "particles", "shield": "plasma",
+}
+
+
 def sphere_style_index(value: str) -> int:
+    """Overlay-safe 0..2 index for the floating Android bubble."""
+    mode = SPHERE_STYLE_OVERLAY.get(str(value), "liquid")
     try:
-        return VALID_SPHERE_STYLES.index(value)
+        return SHADER_SPHERE_STYLES.index(mode)
     except ValueError:
         return 0
+
+
+def shader_sphere_index(value: str) -> int:
+    """GLSL sphere mode for the three styles the shader renders itself."""
+    try:
+        return SHADER_SPHERE_STYLES.index(str(value))
+    except ValueError:
+        return 0
+
+
+def sphere_uses_canvas(value: str) -> bool:
+    """True when the style is drawn by the canvas LivingOrb layer."""
+    return str(value) not in SHADER_SPHERE_STYLES
 
 
 @dataclass
@@ -3005,6 +3114,8 @@ MODEL_SCAN_DIRS = [
     ASSETS_DIR / "phi3",
     ASSETS_PUBLIC_DIR / "phi3",
     Path("/sdcard/phi3"),
+    Path("/sdcard/BoshraAI/phi3"),
+    Path("/storage/emulated/0/phi3"),
     Path("/sdcard/assets/phi3"),
     Path("/sdcard/Download/BoshraModels"),
     Path("/sdcard/BoshraAI/models"),
@@ -3041,15 +3152,17 @@ class ModelManager:
             return self._scan_cache
         found: Dict[str, ModelInfo] = {}
         scan_dirs = list(MODEL_SCAN_DIRS)
+        for root in asset_roots():
+            scan_dirs.extend(_asset_folders("phi3", [root], include_extras=False))
         saved_assets = getattr(self.config, "assets_path", "")
         if saved_assets:
             saved_root = Path(saved_assets)
             scan_dirs = [saved_root / "phi3", saved_root] + scan_dirs
-        for directory in scan_dirs:
+        for directory in _dedupe_paths(scan_dirs):
             try:
                 if not directory.exists():
                     continue
-                for path in list(directory.glob("*.gguf")) + list(directory.glob("*/*.gguf")):
+                for path in _gguf_in_tree(directory, 2):
                     if not path.is_file():
                         continue
                     try:
@@ -3636,17 +3749,40 @@ class PiperBackend(SpeechBackend):
         self.selected_lang = ""
         return False
 
+    @staticmethod
+    def _voice_language(model: Path, root: Path) -> str:
+        """Infer a voice language from its filename, then its folder path."""
+        match = re.match(r"^([a-zA-Z]{2})[_-]([a-zA-Z]{2})", model.name)
+        if match:
+            return match.group(1).lower()
+        try:
+            relative = model.relative_to(root).parts[:-1]
+        except ValueError:
+            relative = ()
+        tokens = {
+            token
+            for part in (*relative, model.stem)
+            for token in re.split(r"[^a-z]+", part.lower())
+            if token
+        }
+        if "ar" in tokens or "arabic" in tokens:
+            return "ar"
+        if "en" in tokens or "english" in tokens:
+            return "en"
+        return "en"
+
     def list_voices(self) -> List[Dict[str, Any]]:
         """Every .onnx voice found under the local piper-tts folders."""
         found: List[Dict[str, Any]] = []
         seen: set = set()
-        roots = [root / "piper-tts" for root in asset_roots()]
-        roots += [PRIVATE_DIR / "piper-tts", Path("/sdcard/assets/piper-tts")]
-        for root in roots:
+        roots = _asset_folders("piper-tts", asset_roots(), include_extras=False)
+        roots += [PRIVATE_DIR / "piper-tts", Path("/sdcard/assets/piper-tts"),
+                  Path("/sdcard/piper-tts"), Path("/storage/emulated/0/piper-tts")]
+        for root in _dedupe_paths(roots):
             try:
                 if not root.exists():
                     continue
-                candidates = sorted(root.rglob("*.onnx"))
+                candidates = _files_with_suffix(root, ".onnx", 4)
             except OSError:
                 continue
             for model in candidates:
@@ -3654,18 +3790,13 @@ class PiperBackend(SpeechBackend):
                 if key in seen:
                     continue
                 seen.add(key)
-                match = re.match(r"^([a-zA-Z]{2})[_-]([a-zA-Z]{2})", model.name)
-                lang = (match.group(1).lower() if match else "")
-                if lang not in ("ar", "en"):
-                    parts = [part.lower() for part in model.parts]
-                    lang = "ar" if "ar" in parts or "arabic" in parts else "en"
                 try:
                     size = model.stat().st_size
                 except OSError:
                     size = 0
                 found.append({
                     "name": model.stem,
-                    "lang": lang,
+                    "lang": self._voice_language(model, root),
                     "path": key,
                     "size": size,
                 })
@@ -3974,36 +4105,65 @@ VOSK_CANDIDATE_DIRS = {
         PRIVATE_DIR / "vosk-model-ar",
         Path("/sdcard/assets/vosk-model-ar"),
         Path("/sdcard/BoshraAI/models/vosk-model-ar"),
+        Path("/sdcard/vosk-ar"),
+        Path("/sdcard/assets/vosk-ar"),
+        Path("/storage/emulated/0/vosk-ar"),
     ],
     "en": [
         ASSETS_DIR / "vosk-model-en",
         PRIVATE_DIR / "vosk-model-en",
         Path("/sdcard/assets/vosk-model-en"),
         Path("/sdcard/BoshraAI/models/vosk-model-en"),
+        Path("/sdcard/vosk-en"),
+        Path("/sdcard/assets/vosk-en"),
+        Path("/storage/emulated/0/vosk-en"),
     ],
 }
 
+_VOSK_FOLDER_ALIASES = {
+    "ar": ("vosk-model-ar", "vosk-ar", "vosk_ar", "vosk_model_ar"),
+    "en": ("vosk-model-en", "vosk-en", "vosk_en", "vosk_model_en"),
+}
 
-def _valid_vosk_model(path: Path) -> bool:
-    return path.is_dir() and ((path / "am").exists() or (path / "conf").exists() or (path / "graph").exists())
+
+def _vosk_lang_matches(path: Path, lang: str) -> bool:
+    """Reject a model folder that clearly belongs to the other language."""
+    tokens = {token for token in re.split(r"[^a-z]+", path.name.lower()) if token}
+    if lang in tokens or (lang == "ar" and "arabic" in tokens):
+        return True
+    other = "en" if lang == "ar" else "ar"
+    return not (other in tokens or (other == "ar" and "arabic" in tokens))
 
 
 def discover_vosk_models() -> Dict[str, str]:
     found: Dict[str, str] = {}
+    roots = asset_roots()
     for lang, candidates in VOSK_CANDIDATE_DIRS.items():
-        candidates = [root / f"vosk-model-{lang}" for root in asset_roots()] + list(candidates)
-        for candidate in candidates:
+        aliases = _VOSK_FOLDER_ALIASES[lang]
+        folders: List[Path] = []
+        for root in roots:
+            for alias in aliases:
+                folders.append(root / alias)
+            if not _is_dir(root):
+                continue
             try:
-                if _valid_vosk_model(candidate):
-                    found[lang] = str(candidate)
-                    break
-                if candidate.exists() and candidate.is_dir():
-                    for child in candidate.iterdir():
-                        if child.is_dir() and _valid_vosk_model(child):
-                            found[lang] = str(child)
-                            break
+                children = sorted(root.iterdir(), key=lambda child: child.name.lower())
             except OSError:
                 continue
+            for child in children:
+                if _is_dir(child) and _folder_matches(
+                    child.name, aliases, f"vosk-{lang}",
+                ):
+                    folders.append(child)
+        folders.extend(candidates)
+        for folder in _dedupe_paths(folders):
+            layout = _vosk_layout(folder)
+            if layout is None:
+                continue
+            model, _found = layout
+            if _vosk_lang_matches(model, lang):
+                found[lang] = str(model)
+                break
     return found
 
 
@@ -9021,7 +9181,11 @@ class IntelligenceOrchestrator:
         match = re.search(r"^(?:open|launch|افتح|شغل|شغّل)\s+(?:the\s+|تطبيق\s+)?(.+?)(?:\s+app)?[.!]?$", norm)
         if match and len(match.group(1)) < 40:
             return ("tool", {"tool": "open_app", "args": {"app": match.group(1).strip()}})
-        match = re.search(r"(?:theme|مظهر|ثيم)\s*[:=]?\s*(aurora|matrix|neon|lava|darkblue|minimal|glass)", norm)
+        match = re.search(
+            r"(?:theme|مظهر|ثيم)\s*[:=]?\s*"
+            r"(aurora|matrix|neon|lava|darkblue|minimal|glass|frost|cosmos|cyber|obsidian|daylight)",
+            norm,
+        )
         if match:
             return ("tool", {"tool": "theme_set", "args": {"theme": match.group(1)}})
         match = re.search(r"\b(lite|balanced|performance)\b", norm)
@@ -9450,7 +9614,7 @@ def _rgba(value: str, alpha: float = 1.0) -> List[float]:
         return [1.0, 1.0, 1.0, float(alpha)]
 
 
-PALETTES: Dict[str, Dict[str, str]] = {
+PALETTES = {
     "aurora": {
         "bg": "#04080f", "panel": "#081521", "text": "#e8f7ff", "dim": "#7d9db5",
         "accent": "#38e8ff", "accent2": "#7a5cff", "danger": "#ff4d6d", "good": "#5dffb0",
@@ -9479,7 +9643,48 @@ PALETTES: Dict[str, Dict[str, str]] = {
         "bg": "#070d12", "panel": "#0d1a22", "text": "#eaf6ff", "dim": "#88a4b5",
         "accent": "#a7e8ff", "accent2": "#8fd4ff", "danger": "#ff5c7a", "good": "#72ffc5",
     },
+    "frost": {
+        "bg": "#0a1628", "panel": "#132238", "text": "#ddeeff", "dim": "#6688aa",
+        "accent": "#88ddff", "accent2": "#aaeeff", "danger": "#ff6b8a", "good": "#9dffd8",
+    },
+    "cosmos": {
+        "bg": "#05051e", "panel": "#0a0a38", "text": "#e0d0ff", "dim": "#7755aa",
+        "accent": "#9d4edd", "accent2": "#e040fb", "danger": "#ff4d6d", "good": "#62ffa8",
+    },
+    "cyber": {
+        "bg": "#0b0c10", "panel": "#1f2833", "text": "#c5c6c7", "dim": "#45a29e",
+        "accent": "#66fcf1", "accent2": "#45a29e", "danger": "#ff5c7a", "good": "#66fcf1",
+    },
+    "obsidian": {
+        "bg": "#0f0f0f", "panel": "#1a1a1a", "text": "#f1faee", "dim": "#a8dadc",
+        "accent": "#e63946", "accent2": "#a8dadc", "danger": "#e63946", "good": "#a8dadc",
+    },
+    "daylight": {
+        "bg": "#f0f4f8", "panel": "#ffffff", "text": "#1a202c", "dim": "#4a5568",
+        "accent": "#3182ce", "accent2": "#2b6cb0", "danger": "#c53030", "good": "#2f855a",
+    },
 }
+
+# Animated backdrop grammar shared with the living orb. Each theme picks one
+# of the Try.py ambience kinds; ``none`` keeps the shader-only backdrop.
+THEME_VISUALS = {
+    "aurora": {"anim": "aurora"},
+    "matrix": {"anim": "rain"},
+    "neon": {"anim": "lightning"},
+    "lava": {"anim": "lava"},
+    "darkblue": {"anim": "aurora"},
+    "minimal": {"anim": "none"},
+    "glass": {"anim": "aurora"},
+    "frost": {"anim": "snow"},
+    "cosmos": {"anim": "stars"},
+    "cyber": {"anim": "aurora"},
+    "obsidian": {"anim": "lightning"},
+    "daylight": {"anim": "none"},
+}
+
+
+def theme_visual(name: str) -> Dict[str, str]:
+    return THEME_VISUALS.get(str(name), THEME_VISUALS["aurora"])
 
 
 def _font_readable(p: Path) -> bool:
@@ -9490,23 +9695,67 @@ def _font_readable(p: Path) -> bool:
         return False
 
 
+def _font_family_pairs() -> List[Tuple[Path, Path]]:
+    """Regular/bold pairs found in asset ``fonts`` folders, Arabic first."""
+    grouped: Dict[str, Dict[str, Path]] = {}
+    for root in asset_roots():
+        for folder in _asset_folders("fonts", [root], include_extras=True):
+            fonts: List[Path] = []
+            for extension in (".ttf", ".otf", ".ttc"):
+                fonts.extend(_files_with_suffix(folder, extension, 3))
+            for font in _dedupe_paths(fonts):
+                if not _font_readable(font):
+                    continue
+                stem = font.stem.lower()
+                key = re.sub(
+                    r"(?:[-_ ]?(?:regular|bold|italic|medium|light|semibold|black|thin))+$",
+                    "", stem,
+                ) or stem
+                key = re.sub(r"[^a-z0-9]+", "", key) or stem
+                slot = "bold" if "bold" in stem else "regular"
+                grouped.setdefault(key, {}).setdefault(slot, font)
+
+    def priority(item: Tuple[str, Dict[str, Path]]):
+        name = " ".join(str(path).lower() for path in item[1].values())
+        arabic = any(token in name for token in (
+            "arab", "naskh", "amiri", "cairo", "tajawal", "kufi", "noto",
+        ))
+        return (0 if arabic else 1, name)
+
+    pairs: List[Tuple[Path, Path]] = []
+    for _key, slots in sorted(grouped.items(), key=priority):
+        regular = slots.get("regular") or slots.get("bold")
+        if regular is not None:
+            pairs.append((regular, slots.get("bold") or regular))
+    return pairs
+
+
 def register_fonts() -> None:
     global FONT
     from kivy.resources import resource_find
 
     packaged = Path(__file__).resolve().parent / "assets" / "fonts"
-    pairs = [
-        (packaged / "DejaVuSans.ttf", packaged / "DejaVuSans-Bold.ttf"),
+    pairs = [(packaged / "DejaVuSans.ttf", packaged / "DejaVuSans-Bold.ttf")]
+    pairs.extend(_font_family_pairs())
+    pairs.extend([
         (Path("/system/fonts/NotoNaskhArabic-Regular.ttf"),
          Path("/system/fonts/NotoNaskhArabic-Bold.ttf")),
         (Path("/system/fonts/NotoSansArabic-Regular.ttf"),
          Path("/system/fonts/NotoSansArabic-Bold.ttf")),
         (Path("/system/fonts/DroidSansArabic.ttf"),
          Path("/system/fonts/DroidSansArabic.ttf")),
-    ]
+    ])
+    seen: set = set()
     for regular, bold in pairs:
         if not _font_readable(regular):
             continue
+        try:
+            key = str(regular.resolve())
+        except OSError:
+            key = str(regular)
+        if key in seen:
+            continue
+        seen.add(key)
         if not _font_readable(bold):
             bold = regular
         try:
@@ -9794,6 +10043,890 @@ class AuroraBackground(Widget):
             LOG.debug(f"shader uniform update failed: {exc}")
 
 
+class ThemeAmbience(Widget):
+    """Per-theme weather/particle layer drawn above the GLSL backdrop.
+
+    Ported from the reference composition: aurora motes, Matrix rain, frost
+    snow, cosmos stars, neon lightning and lava embers. It never handles
+    touches and stays behind every interface panel.
+    """
+
+    FPS = 24
+
+    def __init__(self, palette: Dict[str, str], visual: Optional[Dict[str, str]] = None,
+                 animated: bool = True, profile: str = "BALANCED", **kwargs: Any) -> None:
+        self.palette = palette
+        self.visual = dict(visual or {})
+        self.kind = str(self.visual.get("anim") or "none")
+        self._active = bool(animated) and self.kind != "none"
+        self._t = 0.0
+        self._last = 0.0
+        self._bolt: List[float] = []
+        density = 24 if str(profile).upper() == "LITE" else 46
+        self._items = [
+            {
+                "x": random.random(), "y": random.random(),
+                "spd": random.uniform(0.0015, 0.0075),
+                "sz": random.uniform(1.0, 3.4),
+                "al": random.uniform(0.10, 0.42),
+                "ph": random.uniform(0.0, 6.28),
+                "dr": random.uniform(-0.0022, 0.0022),
+            }
+            for _ in range(density)
+        ]
+        super().__init__(**kwargs)
+        self._event: Optional[Any] = (
+            Clock.schedule_interval(self._frame, 0) if self._active else None
+        )
+
+    def stop(self) -> None:
+        self._active = False
+        if self._event is not None:
+            with contextlib.suppress(Exception):
+                self._event.cancel()
+            self._event = None
+
+    def set_active(self, active: bool) -> None:
+        active = bool(active) and self.kind != "none"
+        if active and self._event is None:
+            self._event = Clock.schedule_interval(self._frame, 0)
+        elif not active and self._event is not None:
+            with contextlib.suppress(Exception):
+                self._event.cancel()
+            self._event = None
+        self._active = active
+        if not active:
+            self.canvas.clear()
+
+    def _frame(self, _dt: float) -> None:
+        if not self._active or self.width <= 1 or self.height <= 1:
+            return
+        now = Clock.get_boottime()
+        if now - self._last < 1.0 / self.FPS:
+            return
+        step = min(0.25, max(1.0 / self.FPS, now - self._last)) if self._last else 1.0 / self.FPS
+        self._last = now
+        self._t += step
+        self.canvas.clear()
+        with self.canvas:
+            try:
+                if self.kind == "rain":
+                    self._paint_rain()
+                elif self.kind == "snow":
+                    self._paint_snow()
+                elif self.kind == "stars":
+                    self._paint_stars()
+                elif self.kind == "lightning":
+                    self._paint_lightning()
+                elif self.kind == "lava":
+                    self._paint_lava()
+                else:
+                    self._paint_aurora()
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug(f"ambience frame failed: {exc}")
+
+    # -- painters --------------------------------------------------------
+    def _paint_aurora(self) -> None:
+        accent = _rgba(self.palette["accent"])
+        alt = _rgba(self.palette["accent2"])
+        for item in self._items[:20]:
+            item["y"] += item["spd"] * 0.35
+            item["x"] += item["dr"] * 0.4
+            if item["y"] > 1.05:
+                item["y"] = -0.05
+                item["x"] = random.random()
+            breathe = 0.5 + 0.5 * math.sin(self._t * 1.2 + item["ph"])
+            mix = (math.sin(self._t * 0.6 + item["ph"]) + 1.0) * 0.5
+            Color(
+                accent[0] * (1 - mix) + alt[0] * mix,
+                accent[1] * (1 - mix) + alt[1] * mix,
+                accent[2] * (1 - mix) + alt[2] * mix,
+                clamp(item["al"] * (0.30 + 0.70 * breathe), 0.0, 0.8),
+            )
+            size = item["sz"] * dp(1.5) * (0.7 + breathe * 0.6)
+            Ellipse(pos=(item["x"] * self.width - size, item["y"] * self.height - size),
+                    size=(size * 2, size * 2))
+
+    def _paint_rain(self) -> None:
+        color = _rgba(self.palette["good"], 0.55)
+        Color(*color)
+        for item in self._items:
+            item["y"] -= item["spd"] * 2.6
+            if item["y"] < 0:
+                item["y"] = 1.0
+                item["x"] = random.random()
+            x = item["x"] * self.width
+            y = item["y"] * self.height
+            Line(points=[x, y, x, y + dp(9) + item["sz"] * dp(2)], width=dp(1))
+
+    def _paint_snow(self) -> None:
+        Color(0.80, 0.90, 1.0, 0.55)
+        for item in self._items:
+            item["y"] -= item["spd"] * 0.8
+            item["x"] += item["dr"]
+            if item["y"] < 0:
+                item["y"] = 1.0
+                item["x"] = random.random()
+            size = item["sz"] * dp(1.6)
+            Ellipse(pos=(item["x"] * self.width, item["y"] * self.height), size=(size, size))
+
+    def _paint_stars(self) -> None:
+        tint = _rgba(self.palette["accent"])
+        for item in self._items:
+            alpha = item["al"] * (0.45 + 0.55 * math.sin(self._t * 2.0 + item["ph"]))
+            Color(tint[0], tint[1], tint[2], clamp(alpha, 0.0, 0.9))
+            size = max(dp(1), item["sz"] * dp(0.8))
+            Ellipse(pos=(item["x"] * self.width, item["y"] * self.height), size=(size, size))
+        if random.random() < 0.008:
+            Color(1, 1, 1, 0.7)
+            start_x = random.uniform(0, self.width)
+            start_y = random.uniform(self.height * 0.55, self.height)
+            Line(points=[start_x, start_y, start_x + dp(42), start_y - dp(22)], width=dp(1))
+
+    def _paint_lightning(self) -> None:
+        wave_colors = (_rgba(self.palette["accent2"], 0.16), _rgba(self.palette["accent"], 0.12))
+        for index, color in enumerate(wave_colors):
+            Color(*color)
+            points: List[float] = []
+            for x in range(0, int(self.width) + 12, 12):
+                points.extend([
+                    x,
+                    self.height * (0.34 + index * 0.16)
+                    + math.sin(x * 0.010 + self._t * 1.6 + index * 2.0) * self.height * 0.05,
+                ])
+            if len(points) >= 4:
+                Line(points=points, width=dp(1.4))
+        if self._bolt:
+            alpha = self._bolt[0]
+            Color(0.92, 0.98, 1.0, max(0.0, alpha))
+            if len(self._bolt) >= 6:
+                Line(points=self._bolt[2:], width=dp(2))
+            self._bolt[0] -= 0.18
+            if self._bolt[0] <= 0:
+                self._bolt = []
+        elif random.random() < 0.012:
+            x = random.uniform(self.width * 0.2, self.width * 0.8)
+            points = [x, self.height]
+            for _ in range(5):
+                x += random.uniform(-dp(22), dp(22))
+                points.extend([x, max(0.0, points[-1] - random.uniform(dp(34), dp(84)))])
+            self._bolt = [0.8, 0] + points
+
+    def _paint_lava(self) -> None:
+        for item in self._items:
+            item["y"] += item["spd"] * 0.55
+            if item["y"] > 0.62:
+                item["y"] = 0.02
+                item["x"] = random.random()
+            flicker = 0.35 + 0.35 * math.sin(self._t + item["ph"])
+            Color(1.0, clamp(0.22 + 0.28 * math.sin(self._t * 2 + item["ph"]), 0.05, 0.8),
+                  0.02, clamp(item["al"] * flicker, 0.0, 0.7))
+            size = item["sz"] * dp(3.2)
+            Ellipse(pos=(item["x"] * self.width, item["y"] * self.height), size=(size, size))
+
+
+ORB_STATE_TUNING = {
+    "idle": {"spd": 0.5, "amp": 0.03, "vis": 0.85, "ci": 0},
+    "thinking": {"spd": 2.0, "amp": 0.05, "vis": 0.30, "ci": 2},
+    "speaking": {"spd": 1.5, "amp": 0.12, "vis": 0.60, "ci": 3},
+    "listening": {"spd": 1.2, "amp": 0.08, "vis": 0.50, "ci": 1},
+}
+
+
+class LivingOrb(Widget):
+    """Canvas living sphere with the twenty reference styles.
+
+    Used for the styles the GLSL shader does not implement (nebula, crystal,
+    DNA, galaxy, ...) and as a fallback when the shader is unavailable.
+    Colours always come from the independent sphere palette, never from the
+    interface theme, so switching themes cannot repaint the ball.
+    """
+
+    FPS = 22
+
+    def __init__(self, primary: Sequence[float], glow: Sequence[float],
+                 style: str = "nebula", state: str = "idle",
+                 animated: bool = True, profile: str = "BALANCED", **kwargs: Any) -> None:
+        self.state = state if state in ORB_STATE_TUNING else "idle"
+        self.style = style if style in VALID_SPHERE_STYLES else "liquid"
+        self._low = str(profile).upper() == "LITE"
+        self._active = bool(animated)
+        self._visible = True
+        self._t = 0.0
+        self._last = 0.0
+        self._pulse = 0.0
+        self._glow = 0.28
+        self._cph = 0.0
+        self._vis = 0.8
+        self._vx = 0.0
+        self._vy = 0.0
+        self._colors = [
+            (1.0, 1.0, 1.0, 1.0), (0.4, 0.8, 1.0, 1.0),
+            (0.6, 0.9, 1.0, 1.0), (1.0, 1.0, 1.0, 0.8),
+        ]
+        super().__init__(**kwargs)
+        self.apply_palette(primary, glow)
+        self._seed()
+        self.bind(pos=self._redraw, size=self._redraw)
+        self._event: Optional[Any] = (
+            Clock.schedule_interval(self._frame, 0) if self._active else None
+        )
+        self._redraw()
+
+    # -- palette and lifecycle ------------------------------------------
+    def apply_palette(self, primary: Sequence[float], glow: Sequence[float]) -> None:
+        first = [clamp(float(value), 0.0, 1.0) for value in list(primary)[:3]]
+        second = [clamp(float(value), 0.0, 1.0) for value in list(glow)[:3]]
+        blend = [first[i] * 0.55 + second[i] * 0.45 for i in range(3)]
+        bright = [min(1.0, first[i] * 0.55 + 0.45) for i in range(3)]
+        self._colors = [
+            (first[0], first[1], first[2], 1.0),
+            (second[0], second[1], second[2], 1.0),
+            (blend[0], blend[1], blend[2], 1.0),
+            (bright[0], bright[1], bright[2], 0.9),
+        ]
+        if self._active:
+            self._redraw()
+
+    def stop(self) -> None:
+        self._active = False
+        if self._event is not None:
+            with contextlib.suppress(Exception):
+                self._event.cancel()
+            self._event = None
+
+    def set_active(self, active: bool) -> None:
+        active = bool(active)
+        if active and self._visible and self._event is None:
+            self._event = Clock.schedule_interval(self._frame, 0)
+        elif not active and self._event is not None:
+            with contextlib.suppress(Exception):
+                self._event.cancel()
+            self._event = None
+        self._active = active
+        if not active:
+            self._redraw()
+
+    def set_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        changed = visible != self._visible
+        self._visible = visible
+        self.opacity = 1.0 if visible else 0.0
+        if changed and self._active:
+            if visible and self._event is None:
+                self._event = Clock.schedule_interval(self._frame, 0)
+            elif not visible and self._event is not None:
+                with contextlib.suppress(Exception):
+                    self._event.cancel()
+                self._event = None
+        if visible:
+            self._redraw()
+
+    def set_state(self, state: str) -> None:
+        self.state = state if state in ORB_STATE_TUNING else "idle"
+        if not self._active:
+            self._redraw()
+
+    def set_style(self, style: str) -> None:
+        if style in VALID_SPHERE_STYLES:
+            self.style = style
+            if not self._active:
+                self._redraw()
+
+    # -- particle model --------------------------------------------------
+    def _seed(self) -> None:
+        scale = 0.55 if self._low else 1.0
+        self._morph = [
+            {
+                "a": 2 * math.pi * i / max(18, int(40 * scale)),
+                "off": 0.0, "spd": random.uniform(0.5, 2.0),
+                "amp": random.uniform(0.02, 0.08), "ph": random.uniform(0, 6.28),
+            }
+            for i in range(max(18, int(40 * scale)))
+        ]
+        self._core = [
+            {
+                "x": random.uniform(-0.3, 0.3), "y": random.uniform(-0.3, 0.3),
+                "vx": random.uniform(-0.01, 0.01), "vy": random.uniform(-0.01, 0.01),
+                "sz": random.uniform(1.6, 6.0), "al": random.uniform(0.3, 0.9),
+                "ph": random.uniform(0, 6.28), "ci": random.randint(0, 3),
+                "life": random.uniform(0.5, 3.0), "ml": random.uniform(2.0, 5.0),
+            }
+            for _ in range(max(16, int(26 * scale)))
+        ]
+        self._orbit = [
+            {
+                "ang": random.uniform(0, 6.28), "rad": random.uniform(0.5, 1.3),
+                "spd": random.uniform(0.2, 1.8), "sz": random.uniform(1.0, 4.0),
+                "al": random.uniform(0.2, 0.7), "ph": random.uniform(0, 6.28),
+                "tilt": random.uniform(-0.3, 0.3), "ecc": random.uniform(0.8, 1.2),
+            }
+            for _ in range(max(18, int(30 * scale)))
+        ]
+        self._aura = [
+            {
+                "ang": random.uniform(0, 6.28), "rad": random.uniform(1.2, 1.9),
+                "spd": random.uniform(0.05, 0.3), "sz": random.uniform(1.0, 2.6),
+                "al": random.uniform(0.05, 0.18), "ph": random.uniform(0, 6.28),
+            }
+            for _ in range(max(10, int(16 * scale)))
+        ]
+        self._tend = [
+            {
+                "ba": 2 * math.pi * i / max(4, int(6 * scale)),
+                "len": random.uniform(0.3, 0.7), "w": random.uniform(0.02, 0.05),
+                "spd": random.uniform(0.3, 1.0), "ph": random.uniform(0, 6.28),
+                "seg": random.randint(4, 9),
+            }
+            for i in range(max(4, int(6 * scale)))
+        ]
+        self._rings = [
+            {
+                "r": 0.55 + i * 0.18, "w": dp(1 + i * 0.3),
+                "al": 0.08 + 0.03 * i, "spd": 0.3 + i * 0.15,
+            }
+            for i in range(3 if self._low else 4)
+        ]
+        self._neural_links: List[Tuple[int, int]] = []
+        count = 12 if self._low else 15
+        for first in range(count):
+            for second in range(first + 1, count):
+                if random.random() < 0.28:
+                    self._neural_links.append((first, second))
+
+    def _update_effects(self, dt: float) -> None:
+        tune = ORB_STATE_TUNING.get(self.state, ORB_STATE_TUNING["idle"])
+        self._vis += (float(tune["vis"]) - self._vis) * 0.06
+        self._pulse = math.sin(self._t * float(tune["spd"]) * math.pi) * float(tune["amp"])
+        self._cph += dt * 0.35
+        if self.state == "speaking":
+            amount = 2.6 * (1.0 - self._vis * 0.5)
+            self._vx = math.sin(self._t * 15) * amount + math.sin(self._t * 23) * amount * 0.3
+            self._vy = math.cos(self._t * 18) * amount * 0.5
+        elif self.state == "thinking":
+            self._vx = math.sin(self._t * 20) * 0.8
+            self._vy = math.cos(self._t * 24) * 0.5
+        else:
+            self._vx *= 0.92
+            self._vy *= 0.92
+        if self.state == "thinking":
+            self._glow = 0.40 + 0.30 * math.sin(self._t * 3) + 0.08 * math.sin(self._t * 7)
+        elif self.state == "speaking":
+            self._glow = 0.35 + 0.25 * abs(math.sin(self._t * 2.2))
+        else:
+            self._glow = 0.25 + 0.10 * math.sin(self._t * 1.5)
+        self._glow = clamp(self._glow, 0.08, 0.9)
+        self._update_particles(dt)
+
+    def _update_particles(self, dt: float) -> None:
+        spread = 1.0 - self._vis
+        for particle in self._core:
+            particle["vx"] += (random.random() - 0.5) * 0.005 * spread
+            particle["vy"] += (random.random() - 0.5) * 0.005 * spread
+            particle["vx"] *= 0.95 + self._vis * 0.04
+            particle["vy"] *= 0.95 + self._vis * 0.04
+            particle["x"] += particle["vx"]
+            particle["y"] += particle["vy"]
+            distance = math.sqrt(particle["x"] ** 2 + particle["y"] ** 2)
+            if distance > 0.4:
+                particle["x"] *= 0.4 / distance
+                particle["y"] *= 0.4 / distance
+                particle["vx"] *= -0.5
+                particle["vy"] *= -0.5
+            particle["life"] += dt
+            if particle["life"] > particle["ml"]:
+                particle["life"] = 0.0
+                particle["x"] = random.uniform(-0.2, 0.2)
+                particle["y"] = random.uniform(-0.2, 0.2)
+        for point in self._morph:
+            target = (
+                point["amp"] * (1 + spread * 3) * math.sin(self._t * point["spd"] + point["ph"])
+            )
+            point["off"] += (target - point["off"]) * (0.1 + 0.2 * spread)
+        for point in self._orbit:
+            point["ang"] += point["spd"] * 0.015 * (1 + spread * 0.5)
+        for point in self._aura:
+            point["ang"] += point["spd"] * 0.01
+
+    # -- drawing ---------------------------------------------------------
+    def _frame(self, _dt: float) -> None:
+        if not self._active or not self._visible:
+            return
+        if self.width <= 1 or self.height <= 1:
+            return
+        now = Clock.get_boottime()
+        if now - self._last < 1.0 / self.FPS:
+            return
+        step = min(0.2, max(1.0 / self.FPS, now - self._last)) if self._last else 1.0 / self.FPS
+        self._last = now
+        self._t += step
+        try:
+            self._update_effects(step)
+            self._draw()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug(f"living orb frame failed: {exc}")
+
+    def _redraw(self, *_args: Any) -> None:
+        if not self._visible or self.width <= 1 or self.height <= 1:
+            return
+        try:
+            self._draw()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug(f"living orb redraw failed: {exc}")
+
+    def _draw(self) -> None:
+        self.canvas.clear()
+        with self.canvas:
+            center_x = self.center_x + self._vx
+            center_y = self.center_y + self._vy
+            radius = min(self.width, self.height) * 0.44 * (1 + self._pulse)
+            if radius <= 0:
+                return
+            colors = self._colors
+            tune = ORB_STATE_TUNING.get(self.state, ORB_STATE_TUNING["idle"])
+            index = int(tune["ci"]) % len(colors)
+            color = colors[index]
+            alt = colors[(index + 1) % len(colors)]
+            center_rgb = (0.5 * (color[0] + alt[0]), 0.5 * (color[1] + alt[1]),
+                          0.5 * (color[2] + alt[2]))
+
+            if not self._low:
+                for aura in self._aura:
+                    px = center_x + math.cos(aura["ang"] + self._t * aura["spd"]) * radius * aura["rad"]
+                    py = center_y + math.sin(aura["ang"] + self._t * aura["spd"] * 0.7) * radius * aura["rad"]
+                    alpha = aura["al"] * (0.5 + 0.5 * math.sin(self._t * 2 + aura["ph"]))
+                    Color(color[0], color[1], color[2], clamp(alpha, 0.0, 0.7))
+                    size = aura["sz"] * dp(1) * (1 + self._pulse)
+                    Ellipse(pos=(px - size, py - size), size=(size * 2, size * 2))
+                for ring in self._rings:
+                    ring["rotation"] = ring.get("rotation", 0.0) + ring["spd"] * 0.01
+                    ring_radius = radius * ring["r"] * (1 + self._pulse * 0.5)
+                    Color(color[0], color[1], color[2],
+                          clamp(ring["al"] * (1 + self._glow * 0.5), 0.0, 0.7))
+                    Line(circle=(center_x, center_y, ring_radius), width=ring["w"])
+            glow_layers = 4 if self._low else 6
+            for layer in range(glow_layers, 0, -1):
+                fraction = layer / glow_layers
+                mix = (math.sin(self._cph + fraction * 3) + 1.0) * 0.5
+                alpha = self._glow * (layer / (glow_layers * 2.4))
+                Color(
+                    color[0] * (1 - mix) + alt[0] * mix,
+                    color[1] * (1 - mix) + alt[1] * mix,
+                    color[2] * (1 - mix) + alt[2] * mix,
+                    clamp(alpha, 0.0, 0.8),
+                )
+                glow = radius + layer * dp(11) * (1 + (0.4 if self._low else 0.8))
+                Ellipse(pos=(center_x - glow, center_y - glow), size=(glow * 2, glow * 2))
+
+            self._draw_style(center_x, center_y, radius, color, alt)
+            if self.style != "particle":
+                self._draw_core(center_x, center_y, radius, color)
+                self._draw_orbit(center_x, center_y, radius, color, alt)
+            self._draw_tendrils(center_x, center_y, radius, color)
+            core_alpha = clamp(0.3 + 0.25 * math.sin(self._t * 2), 0.0, 0.85)
+            Color(1, 1, 1, core_alpha)
+            core_radius = radius * 0.18 * (1 + self._pulse * 2)
+            Ellipse(pos=(center_x - core_radius, center_y - core_radius + radius * 0.1),
+                    size=(core_radius * 2, core_radius * 2))
+            Color(center_rgb[0], center_rgb[1], center_rgb[2], core_alpha * 0.45)
+            highlight = radius * 0.07
+            Ellipse(pos=(center_x - highlight - radius * 0.10,
+                         center_y - highlight + radius * 0.22),
+                    size=(highlight * 2, highlight * 2))
+
+    def _draw_core(self, center_x: float, center_y: float, radius: float,
+                   color: Sequence[float]) -> None:
+        colors = self._colors
+        for particle in self._core:
+            tint = colors[particle["ci"] % len(colors)]
+            life = 1 - abs(particle["life"] / particle["ml"] - 0.5) * 2
+            alpha = particle["al"] * life * (0.5 + 0.5 * math.sin(self._t * 2 + particle["ph"]))
+            if alpha < 0.01:
+                continue
+            Color(tint[0], tint[1], tint[2], clamp(alpha, 0.0, 0.9))
+            px = center_x + particle["x"] * radius * 2
+            py = center_y + particle["y"] * radius * 2
+            size = particle["sz"] * dp(1) * (1 + self._pulse)
+            Ellipse(pos=(px - size, py - size), size=(size * 2, size * 2))
+
+    def _draw_orbit(self, center_x: float, center_y: float, radius: float,
+                    color: Sequence[float], alt: Sequence[float]) -> None:
+        for point in self._orbit:
+            orbit_radius = radius * point["rad"] * (1 + self._pulse * 0.3)
+            px = center_x + math.cos(point["ang"]) * orbit_radius * point["ecc"]
+            py = (center_y + math.sin(point["ang"]) * orbit_radius
+                  + point["tilt"] * radius * math.sin(self._t + point["ph"]))
+            alpha = point["al"] * (0.5 + 0.5 * math.sin(self._t * 2 + point["ph"]))
+            mix = (math.sin(self._cph * 2 + point["ph"]) + 1.0) * 0.5
+            Color(
+                color[0] * (1 - mix) + alt[0] * mix,
+                color[1] * (1 - mix) + alt[1] * mix,
+                color[2] * (1 - mix) + alt[2] * mix,
+                clamp(alpha, 0.0, 0.9),
+            )
+            size = point["sz"] * dp(1) * (1 + self._pulse * 1.5)
+            Ellipse(pos=(px - size, py - size), size=(size * 2, size * 2))
+
+    def _draw_tendrils(self, center_x: float, center_y: float, radius: float,
+                       color: Sequence[float]) -> None:
+        if self.style not in ("liquid", "jellyfish", "flame", "plasma", "nebula", "vortex"):
+            return
+        for tendril in self._tend:
+            base = tendril["ba"] + self._t * 0.2
+            length = radius * tendril["len"] * (1 + self._pulse + (1 - self._vis) * 0.5)
+            length *= 0.5 + 0.5 * math.sin(self._t * tendril["spd"] + tendril["ph"])
+            if length < dp(5):
+                continue
+            points = [center_x + math.cos(base) * radius * 0.8,
+                      center_y + math.sin(base) * radius * 0.8]
+            for segment in range(tendril["seg"]):
+                fraction = (segment + 1) / tendril["seg"]
+                angle = base + math.sin(self._t * tendril["spd"] + segment * 0.8 + tendril["ph"]) \
+                    * 0.4 * (1 - self._vis)
+                distance = radius * 0.8 + length * fraction
+                points.extend([center_x + math.cos(angle) * distance,
+                               center_y + math.sin(angle) * distance])
+            Color(color[0], color[1], color[2], clamp(0.2 * (1 - self._vis * 0.5), 0.0, 0.5))
+            Line(points=points, width=dp(1.4))
+
+    # -- style bodies ----------------------------------------------------
+    def _draw_style(self, center_x: float, center_y: float, radius: float,
+                    color: Sequence[float], alt: Sequence[float]) -> None:
+        style = self.style
+        if style in ("liquid", "plasma", "nebula", "jellyfish", "flame", "vortex"):
+            self._draw_morph(center_x, center_y, radius)
+        elif style == "crystal":
+            self._draw_crystal(center_x, center_y, radius, color, alt)
+        elif style in ("pulse", "quantum"):
+            self._draw_pulse(center_x, center_y, radius, color)
+        elif style == "particle":
+            self._draw_particle(center_x, center_y, radius)
+        elif style == "hologram":
+            self._draw_hologram(center_x, center_y, radius, color)
+        elif style == "singularity":
+            self._draw_singularity(center_x, center_y, radius)
+        elif style == "dna":
+            self._draw_dna(center_x, center_y, radius, color, alt)
+        elif style == "neural":
+            self._draw_neural(center_x, center_y, radius)
+        elif style == "eye":
+            self._draw_eye(center_x, center_y, radius, color)
+        elif style == "galaxy":
+            self._draw_galaxy(center_x, center_y, radius)
+        elif style == "atom":
+            self._draw_atom(center_x, center_y, radius, color, alt)
+        elif style == "heartbeat":
+            self._draw_heartbeat(center_x, center_y, radius, color)
+        elif style == "soundwave":
+            self._draw_soundwave(center_x, center_y, radius, color, alt)
+        elif style == "shield":
+            self._draw_shield(center_x, center_y, radius, color, alt)
+        else:
+            self._draw_morph(center_x, center_y, radius)
+
+    def _draw_morph(self, center_x: float, center_y: float, radius: float) -> None:
+        colors = self._colors
+        layers = 4 if self._low else 6
+        for layer in range(layers, 0, -1):
+            fraction = layer / layers
+            local_radius = radius * fraction
+            alpha = 0.12 + 0.08 * fraction + self._glow * 0.1
+            mix = (math.sin(self._cph + fraction * 6.28) + 1.0) * 0.5
+            first = colors[int(self._cph * 2) % len(colors)]
+            second = colors[(int(self._cph * 2) + 1) % len(colors)]
+            Color(
+                first[0] * (1 - mix) + second[0] * mix,
+                first[1] * (1 - mix) + second[1] * mix,
+                first[2] * (1 - mix) + second[2] * mix,
+                clamp(alpha, 0.0, 0.8),
+            )
+            points: List[float] = []
+            for point in self._morph:
+                distance = 1 + point["off"] * fraction * (1 + (1 - self._vis) * 3)
+                points.extend([center_x + math.cos(point["a"]) * local_radius * distance,
+                               center_y + math.sin(point["a"]) * local_radius * distance])
+            if len(points) >= 6:
+                points.extend(points[:2])
+                Line(points=points, width=dp(0.6 + fraction * 1.2))
+
+    def _draw_crystal(self, center_x: float, center_y: float, radius: float,
+                      color: Sequence[float], alt: Sequence[float]) -> None:
+        for layer in range(5, 0, -1):
+            fraction = layer / 5
+            local_radius = radius * fraction
+            mix = (math.sin(self._cph + layer) + 1.0) * 0.5
+            Color(
+                color[0] * (1 - mix) + alt[0] * mix,
+                color[1] * (1 - mix) + alt[1] * mix,
+                color[2] * (1 - mix) + alt[2] * mix,
+                clamp(0.10 + 0.10 * fraction, 0.0, 0.5),
+            )
+            count = 4 + layer
+            points: List[float] = []
+            for index in range(count + 1):
+                angle = 6.28 * index / count + self._t * 0.1 * layer
+                points.extend([center_x + math.cos(angle) * local_radius,
+                               center_y + math.sin(angle) * local_radius])
+            if len(points) >= 4:
+                Line(points=points, width=dp(1.3))
+
+    def _draw_pulse(self, center_x: float, center_y: float, radius: float,
+                    color: Sequence[float]) -> None:
+        for layer in range(4, 0, -1):
+            Color(color[0], color[1], color[2], clamp(0.12 + 0.05 * layer / 4, 0.0, 0.5))
+            size = radius * layer / 4
+            Ellipse(pos=(center_x - size, center_y - size), size=(size * 2, size * 2))
+        for index in range(5):
+            phase = (self._t * 1.5 + index * 0.7) % 3
+            ring_radius = radius * 0.3 + radius * 0.8 * phase / 3
+            Color(color[0], color[1], color[2], clamp(0.4 * (1 - phase / 3), 0.0, 0.5))
+            Line(circle=(center_x, center_y, ring_radius), width=dp(1.8))
+
+    def _draw_particle(self, center_x: float, center_y: float, radius: float) -> None:
+        colors = self._colors
+        for particle in self._core:
+            px = center_x + particle["x"] * radius * 2.4
+            py = center_y + particle["y"] * radius * 2.4
+            alpha = particle["al"] * (0.5 + 0.5 * math.sin(self._t * 3 + particle["ph"]))
+            tint = colors[particle["ci"] % len(colors)]
+            Color(tint[0], tint[1], tint[2], clamp(alpha, 0.0, 0.9))
+            size = particle["sz"] * dp(1.3)
+            Ellipse(pos=(px - size, py - size), size=(size * 2, size * 2))
+        for point in self._orbit:
+            angle = point["ang"] + self._t * point["spd"]
+            orbit_radius = radius * point["rad"]
+            px = center_x + math.cos(angle) * orbit_radius
+            py = center_y + math.sin(angle) * orbit_radius
+            alpha = point["al"] * (0.5 + 0.5 * math.sin(self._t * 3 + point["ph"]))
+            Color(colors[0][0], colors[0][1], colors[0][2], clamp(alpha, 0.0, 0.9))
+            size = point["sz"] * dp(1.2)
+            Ellipse(pos=(px - size, py - size), size=(size * 2, size * 2))
+
+    def _draw_hologram(self, center_x: float, center_y: float, radius: float,
+                       color: Sequence[float]) -> None:
+        for layer in range(5, 0, -1):
+            Color(color[0], color[1], color[2], clamp(0.08 + 0.05 * layer / 5, 0.0, 0.5))
+            size = radius * layer / 6
+            Ellipse(pos=(center_x - size, center_y - size), size=(size * 2, size * 2))
+        for index in range(16):
+            y = center_y - radius + radius * 2 * index / 16
+            offset = math.sin(self._t * 3 + index * 0.5) * dp(3)
+            offset_ratio = (y - center_y) / radius
+            half = radius * math.sqrt(max(0.0, 1 - offset_ratio ** 2))
+            if half <= 0:
+                continue
+            alpha = 0.15 + 0.10 * math.sin(self._t * 5 + index)
+            Color(color[0], color[1], color[2], clamp(alpha, 0.0, 0.4))
+            Line(points=[center_x - half + offset, y, center_x + half + offset, y], width=dp(1))
+
+    def _draw_singularity(self, center_x: float, center_y: float, radius: float) -> None:
+        core = radius * 0.3
+        Color(0, 0, 0, 0.85)
+        Ellipse(pos=(center_x - core, center_y - core), size=(core * 2, core * 2))
+        rings = 8 if self._low else 12
+        for index in range(rings):
+            ring_radius = radius * 0.4 + radius * 0.06 * index
+            rotation = self._t * (1.5 - index * 0.1) + index * 0.5
+            tint = self._colors[index % len(self._colors)]
+            Color(tint[0], tint[1], tint[2], clamp(max(0.02, 0.2 - index * 0.012), 0.0, 0.3))
+            points: List[float] = []
+            for step in range(36):
+                angle = 6.28 * step / 36 + rotation
+                distance = ring_radius * (1 + 0.1 * math.sin(angle * 3 + self._t * 2))
+                points.extend([center_x + math.cos(angle) * distance,
+                               center_y + math.sin(angle) * distance * 0.4])
+            if len(points) >= 4:
+                Line(points=points, width=dp(1.1))
+
+    def _draw_dna(self, center_x: float, center_y: float, radius: float,
+                  color: Sequence[float], alt: Sequence[float]) -> None:
+        for strand in range(2):
+            points: List[float] = []
+            for index in range(40):
+                phase = index / 40 * 4 * math.pi + self._t * 2 + strand * math.pi
+                y = center_y - radius + radius * 2 * index / 40
+                points.extend([center_x + math.sin(phase) * radius * 0.3, y])
+            if len(points) >= 4:
+                tint = color if strand == 0 else alt
+                alpha = 0.4 + 0.2 * math.sin(self._t + strand)
+                Color(tint[0], tint[1], tint[2], clamp(alpha, 0.0, 0.7))
+                Line(points=points, width=dp(2))
+        for index in range(0, 40, 5):
+            phase = index / 40 * 4 * math.pi + self._t * 2
+            y = center_y - radius + radius * 2 * index / 40
+            Color(1, 1, 1, 0.15)
+            Line(points=[center_x + math.sin(phase) * radius * 0.3, y,
+                         center_x + math.sin(phase + math.pi) * radius * 0.3, y], width=dp(1))
+
+    def _draw_neural(self, center_x: float, center_y: float, radius: float) -> None:
+        count = 12 if self._low else 15
+        nodes: List[Tuple[float, float]] = []
+        for index in range(count):
+            angle = 6.28 * index / count + self._t * 0.2
+            node_radius = radius * (0.25 + 0.55 * ((index * 37) % 100) / 100)
+            nodes.append((center_x + math.cos(angle) * node_radius,
+                          center_y + math.sin(angle) * node_radius))
+        colors = self._colors
+        for first, second in self._neural_links:
+            if first >= len(nodes) or second >= len(nodes):
+                continue
+            Color(colors[0][0], colors[0][1], colors[0][2],
+                  clamp(0.06 + 0.05 * math.sin(self._t * 3 + first + second), 0.0, 0.2))
+            Line(points=[nodes[first][0], nodes[first][1], nodes[second][0], nodes[second][1]],
+                 width=dp(0.8))
+        for index, (nx, ny) in enumerate(nodes):
+            pulse = 0.5 + 0.5 * math.sin(self._t * 2 + index)
+            tint = colors[index % len(colors)]
+            Color(tint[0], tint[1], tint[2], clamp(0.6 * pulse, 0.0, 0.9))
+            size = dp(3.0 + 2.0 * pulse)
+            Ellipse(pos=(nx - size, ny - size), size=(size * 2, size * 2))
+
+    def _draw_eye(self, center_x: float, center_y: float, radius: float,
+                  color: Sequence[float]) -> None:
+        for layer in range(4, 0, -1):
+            fraction = layer / 4
+            Color(color[0], color[1], color[2], clamp(0.10 + 0.05 * fraction, 0.0, 0.4))
+            points: List[float] = []
+            for index in range(40):
+                angle = 6.28 * index / 40
+                points.extend([center_x + math.cos(angle) * radius * fraction,
+                               center_y + math.sin(angle) * radius * fraction * 0.6])
+            points.extend(points[:2])
+            if len(points) >= 4:
+                Line(points=points, width=dp(1.3))
+        iris = radius * 0.35
+        Color(color[0], color[1], color[2], 0.45)
+        Ellipse(pos=(center_x - iris, center_y - iris), size=(iris * 2, iris * 2))
+        pupil = radius * 0.15 * (1 + 0.3 * math.sin(self._t * 2))
+        Color(0, 0, 0, 0.92)
+        Ellipse(pos=(center_x - pupil, center_y - pupil), size=(pupil * 2, pupil * 2))
+        Color(1, 1, 1, 0.65)
+        highlight = radius * 0.06
+        Ellipse(pos=(center_x - highlight + radius * 0.08, center_y - highlight + radius * 0.08),
+                size=(highlight * 2, highlight * 2))
+
+    def _draw_galaxy(self, center_x: float, center_y: float, radius: float) -> None:
+        colors = self._colors
+        for arm in range(3):
+            points: List[float] = []
+            base = arm * 2.094 + self._t * 0.3
+            for index in range(32):
+                fraction = index / 32
+                angle = base + fraction * 4 * math.pi
+                distance = radius * 0.1 + radius * 0.9 * fraction
+                points.extend([center_x + math.cos(angle) * distance,
+                               center_y + math.sin(angle) * distance * 0.5])
+            if len(points) >= 4:
+                tint = colors[arm % len(colors)]
+                Color(tint[0], tint[1], tint[2], 0.28)
+                Line(points=points, width=dp(2))
+        Color(1, 1, 0.9, 0.55)
+        core = radius * 0.15
+        Ellipse(pos=(center_x - core, center_y - core), size=(core * 2, core * 2))
+
+    def _draw_atom(self, center_x: float, center_y: float, radius: float,
+                   color: Sequence[float], alt: Sequence[float]) -> None:
+        Color(color[0], color[1], color[2], 0.5)
+        nucleus = radius * 0.12
+        Ellipse(pos=(center_x - nucleus, center_y - nucleus), size=(nucleus * 2, nucleus * 2))
+        for orbit in range(3):
+            points: List[float] = []
+            tilt = orbit * 1.047
+            for index in range(40):
+                angle = 6.28 * index / 40 + self._t * (1 + orbit * 0.3)
+                points.extend([
+                    center_x + math.cos(angle) * radius * 0.8,
+                    center_y + math.sin(angle) * radius * 0.3 * math.cos(tilt)
+                    + math.cos(angle) * radius * 0.3 * math.sin(tilt),
+                ])
+            points.extend(points[:2])
+            if len(points) >= 4:
+                mix = orbit / 3
+                Color(color[0] * (1 - mix) + alt[0] * mix,
+                      color[1] * (1 - mix) + alt[1] * mix,
+                      color[2] * (1 - mix) + alt[2] * mix, 0.3)
+                Line(points=points, width=dp(1.4))
+            electron = self._t * (2 + orbit) + orbit * 2.094
+            ex = center_x + math.cos(electron) * radius * 0.8
+            ey = (center_y + math.sin(electron) * radius * 0.3 * math.cos(tilt)
+                  + math.cos(electron) * radius * 0.3 * math.sin(tilt))
+            Color(1, 1, 1, 0.75)
+            size = dp(3.2)
+            Ellipse(pos=(ex - size, ey - size), size=(size * 2, size * 2))
+
+    def _draw_heartbeat(self, center_x: float, center_y: float, radius: float,
+                        color: Sequence[float]) -> None:
+        points: List[float] = []
+        for index in range(120):
+            x = center_x - radius + radius * 2 * index / 120
+            phase = index / 120 * 4 * math.pi + self._t * 3
+            if (index % 50) < 10:
+                y = center_y + math.sin(phase * 3) * radius * 0.4
+            elif (index % 50) < 15:
+                y = center_y - radius * 0.3
+            elif (index % 50) < 20:
+                y = center_y + radius * 0.2
+            else:
+                y = center_y + math.sin(phase) * radius * 0.02
+            points.extend([x, y])
+        if len(points) >= 4:
+            Color(color[0], color[1], color[2], 0.55)
+            Line(points=points, width=dp(2))
+        for layer in range(4, 0, -1):
+            beat = 1 + 0.15 * math.sin(self._t * 3) * layer / 4
+            size = radius * 0.25 * beat
+            Color(color[0], color[1], color[2], clamp(0.1 * layer / 4, 0.0, 0.4))
+            Ellipse(pos=(center_x - size, center_y - size), size=(size * 2, size * 2))
+
+    def _draw_soundwave(self, center_x: float, center_y: float, radius: float,
+                        color: Sequence[float], alt: Sequence[float]) -> None:
+        for wave in range(5):
+            points: List[float] = []
+            base = radius * 0.3 + radius * 0.15 * wave
+            for index in range(56):
+                angle = 6.28 * index / 56
+                wobble = math.sin(angle * 8 + self._t * 4 + wave) * radius * 0.05
+                distance = base + wobble
+                points.extend([center_x + math.cos(angle) * distance,
+                               center_y + math.sin(angle) * distance])
+            points.extend(points[:2])
+            if len(points) >= 4:
+                mix = wave / 5
+                Color(color[0] * (1 - mix) + alt[0] * mix,
+                      color[1] * (1 - mix) + alt[1] * mix,
+                      color[2] * (1 - mix) + alt[2] * mix,
+                      clamp(0.18 + 0.05 * wave, 0.0, 0.5))
+                Line(points=points, width=dp(1.4))
+
+    def _draw_shield(self, center_x: float, center_y: float, radius: float,
+                     color: Sequence[float], alt: Sequence[float]) -> None:
+        for layer in range(4, 0, -1):
+            fraction = layer / 4
+            points: List[float] = []
+            for index in range(7):
+                angle = 6.28 * index / 6 + self._t * 0.2 * layer
+                points.extend([center_x + math.cos(angle) * radius * fraction,
+                               center_y + math.sin(angle) * radius * fraction])
+            mix = fraction
+            Color(color[0] * (1 - mix) + alt[0] * mix,
+                  color[1] * (1 - mix) + alt[1] * mix,
+                  color[2] * (1 - mix) + alt[2] * mix,
+                  clamp(0.10 + 0.05 * fraction, 0.0, 0.4))
+            if len(points) >= 4:
+                Line(points=points, width=dp(1.8))
+        for layer in range(2):
+            inner = radius * 0.32 + radius * 0.1 * layer
+            outer = radius * 0.78 - radius * 0.1 * layer
+            for index in range(6):
+                first = 6.28 * index / 6 + self._t * 0.2 * (layer + 1)
+                second = 6.28 * (index + 0.5) / 6 + self._t * 0.2 * (layer + 1)
+                Color(color[0], color[1], color[2], 0.10)
+                Line(points=[center_x + math.cos(first) * inner,
+                             center_y + math.sin(first) * inner,
+                             center_x + math.cos(second) * outer,
+                             center_y + math.sin(second) * outer], width=dp(1))
+
+
 class GlassPanel(BoxLayout):
     """Rounded translucent surface used by every dashboard panel."""
 
@@ -10037,6 +11170,9 @@ class NeonButton(Button):
             self._fill_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(8)])
             self._border_color = Color(*_rgba(palette.get(tone, palette["accent"]), 0.42))
             self._border_line = Line(width=1.0)
+            # Glass highlight borrowed from the reference buttons.
+            self._shine_color = Color(1, 1, 1, 0.055)
+            self._shine = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(8)])
         self.bind(
             pos=self._sync_shape, size=self._sync_shape,
             state=self._sync_shape, disabled=self._sync_shape,
@@ -10077,6 +11213,12 @@ class NeonButton(Button):
         self._fill_rect.size = self.size
         self._fill_rect.radius = [radius]
         self._border_line.rounded_rectangle = (self.x, self.y, self.width, self.height, radius)
+        shine_height = max(0.0, self.height * 0.42)
+        shine_pad = dp(2)
+        shine_radius = min(radius, shine_height * 0.5) if shine_height > 0 else radius
+        self._shine.pos = (self.x + shine_pad, self.y + self.height - shine_height - dp(1))
+        self._shine.size = (max(0.0, self.width - shine_pad * 2), shine_height)
+        self._shine.radius = [0, 0, shine_radius, shine_radius]
         rgba = list(self._fill_rgba)
         if self.disabled:
             rgba[3] = rgba[3] * 0.45
@@ -13463,6 +14605,16 @@ class SettingsScreen(ScreenBase):
             cfg.sphere_style, self.set_sphere_style,
         )
         self._chip_row(
+            T("Living forms", "أشكال حية"),
+            [("nebula", "Nebula"), ("crystal", "Crystal"), ("pulse", "Pulse"),
+             ("hologram", "Hologram"), ("singularity", "Singularity"), ("dna", "DNA"),
+             ("quantum", "Quantum"), ("flame", "Flame"), ("vortex", "Vortex"),
+             ("jellyfish", "Jellyfish"), ("neural", "Neural"), ("eye", "Eye"),
+             ("galaxy", "Galaxy"), ("atom", "Atom"), ("heartbeat", "Heartbeat"),
+             ("soundwave", "Sound wave"), ("shield", "Shield")],
+            cfg.sphere_style, self.set_sphere_style,
+        )
+        self._chip_row(
             T("Sphere colour", "لون الكرة"),
             [("cyan", "Cyan"), ("magenta", "Magenta"), ("gold", "Gold"),
              ("green", "Green"), ("violet", "Violet")],
@@ -13645,6 +14797,10 @@ class SettingsScreen(ScreenBase):
         self.core.config.set("animations", value)
         if self.app.background:
             self.app.background._active = bool(value)
+        for attr in ("ambience", "living_orb"):
+            layer = getattr(self.app, attr, None)
+            if layer is not None:
+                layer.set_active(bool(value))
 
     def set_ui_sound(self, value: bool) -> None:
         self.core.config.set("ui_sound", bool(value))
@@ -13675,8 +14831,7 @@ class SettingsScreen(ScreenBase):
 
     def set_sphere_style(self, value: str) -> None:
         self.core.config.set("sphere_style", value)
-        if self.app.background and value in VALID_SPHERE_STYLES:
-            self.app.background.sphere_style = float(VALID_SPHERE_STYLES.index(value))
+        self.app._apply_sphere_visuals()
         if getattr(self.app, "_float_running", False):
             self.core.bridge.float_refresh(self.core.config.sphere_color, value)
 
@@ -13688,6 +14843,9 @@ class SettingsScreen(ScreenBase):
         if self.app.background:
             self.app.background.sphere_tint = primary
             self.app.background.sphere_glow = glow
+        living = getattr(self.app, "living_orb", None)
+        if living is not None:
+            living.apply_palette(primary, glow)
         orb = getattr(self.app, "float_orb", None)
         if orb is not None:
             orb.apply_sphere_colors(value)
@@ -14378,17 +15536,34 @@ class BoshraApp(App):
         self.background.fps = int(self.core.resources.profile.get("shader_fps", 40))
         self.background.intensity = float(self.core.config.shader_intensity)
         self.background._active = bool(self.core.config.animations)
-        with contextlib.suppress(ValueError):
-            self.background.sphere_style = float(
-                VALID_SPHERE_STYLES.index(self.core.config.sphere_style)
-            )
+        self.background.sphere_style = float(shader_sphere_index(self.core.config.sphere_style))
         sphere_primary, sphere_glow = sphere_colors(self.core.config.sphere_color)
         self.background.sphere_tint = sphere_primary
         self.background.sphere_glow = sphere_glow
         self._root.add_widget(self.background)
 
+        self.ambience = ThemeAmbience(
+            self.palette,
+            theme_visual(self.core.config.theme),
+            animated=bool(self.core.config.animations),
+            profile=self.core.config.profile,
+            size_hint=(None, None),
+        )
+        self._root.add_widget(self.ambience)
+
+        self.living_orb = LivingOrb(
+            sphere_primary, sphere_glow,
+            style=self.core.config.sphere_style,
+            state=getattr(self, "_orb_state", "idle"),
+            animated=bool(self.core.config.animations),
+            profile=self.core.config.profile,
+            size_hint=(None, None),
+        )
+        self._root.add_widget(self.living_orb)
+
         self.sphere_touch = SphereTouch(self, size_hint=(None, None))
         self._root.add_widget(self.sphere_touch)
+        self._apply_sphere_visuals()
 
         self.telemetry = GlassPanel(
             self.palette, orientation="vertical", size_hint=(None, None),
@@ -14517,6 +15692,11 @@ class BoshraApp(App):
         if background is not None:
             with contextlib.suppress(Exception):
                 background.stop()
+        for attr in ("ambience", "living_orb"):
+            layer = getattr(self, attr, None)
+            if layer is not None:
+                with contextlib.suppress(Exception):
+                    layer.stop()
 
     def _after_start(self, _dt: float) -> None:
         chat = self.screens.get("chat")
@@ -14771,6 +15951,9 @@ class BoshraApp(App):
         if getattr(self, "background", None) is not None:
             self.background.pos = (0, 0)
             self.background.size = (width, height)
+        if getattr(self, "ambience", None) is not None:
+            self.ambience.pos = (0, 0)
+            self.ambience.size = (width, height)
 
         self.header.pos = (0, height - safe_top - header_h)
         self.header.size = (width, header_h)
@@ -14817,6 +16000,10 @@ class BoshraApp(App):
             center_y = max(center_y, safe_bottom + nav_h + diameter * 0.5 + dp(3))
         self.sphere_touch.size = (diameter, diameter)
         self.sphere_touch.pos = (center_x - diameter * 0.5, center_y - diameter * 0.5)
+        orb = getattr(self, "living_orb", None)
+        if orb is not None:
+            orb.size = (diameter, diameter)
+            orb.pos = (center_x - diameter * 0.5, center_y - diameter * 0.5)
         if getattr(self, "background", None) is not None:
             self.background.sphere_center = [center_x / max(1.0, width),
                                              center_y / max(1.0, height)]
@@ -15082,9 +16269,13 @@ class BoshraApp(App):
 
     def set_state(self, state: str) -> None:
         state = state if state in STATE_VALUES else "idle"
+        self._orb_state = state
         if getattr(self, "background", None) is not None:
             self.background.target_state = STATE_VALUES[state]
             self.background.energy = STATE_ENERGY[state]
+        orb = getattr(self, "living_orb", None)
+        if orb is not None:
+            orb.set_state(state)
         if getattr(self, "state_label", None) is not None:
             english, arabic = STATE_LABELS[state]
             self.state_label.text = shape_text(T(english, arabic))
@@ -15093,6 +16284,23 @@ class BoshraApp(App):
                 "speaking": "danger", "listening": "good",
             }.get(state, "accent")
             self.state_label.color = _rgba(self.palette[color])
+
+    def _apply_sphere_visuals(self) -> None:
+        """Show the shader sphere or the canvas orb, never both."""
+        style = self.core.config.sphere_style
+        if style not in VALID_SPHERE_STYLES:
+            style = "liquid"
+        shader_ready = not bool(getattr(self.background, "_fallback", False))
+        canvas_mode = sphere_uses_canvas(style) or not shader_ready
+        if getattr(self, "background", None) is not None:
+            self.background.sphere_style = float(shader_sphere_index(style))
+            self.background.target_sphere_alpha = 0.0 if canvas_mode else 1.0
+            if canvas_mode:
+                self.background.sphere_alpha = 0.0
+        orb = getattr(self, "living_orb", None)
+        if orb is not None:
+            orb.set_style(style)
+            orb.set_visible(canvas_mode)
 
     def toggle_telemetry(self) -> None:
         self.telem_enabled = not self.telem_enabled
