@@ -2726,6 +2726,19 @@ class AndroidBridge:
         return None
 
     # -- window insets / responsive shell -------------------------------
+    def set_soft_input_resize(self) -> None:
+        """Ask Android to resize the activity (not pan it) when the IME opens."""
+        if not self.available:
+            return
+        try:
+            LayoutParams = self.autoclass("android.view.WindowManager$LayoutParams")
+            self.activity.getWindow().setSoftInputMode(
+                LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                | LayoutParams.SOFT_INPUT_STATE_UNCHANGED
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"soft input resize failed: {exc}")
+
     def window_insets(self) -> Dict[str, int]:
         """Return safe-area and system bar sizes in pixels (0 on desktop)."""
         if not self.available:
@@ -2809,8 +2822,24 @@ class AndroidBridge:
             service = self.autoclass("org.bochra.bochra.BoshraFloatService")
             service.clearSuppressed()
 
+    def float_position(self) -> Optional[Tuple[float, float]]:
+        """Bubble centre saved by the overlay as display fractions, if any."""
+        if not self.available:
+            return None
+        try:
+            service = self.autoclass("org.bochra.bochra.BoshraFloatService")
+            fx = float(service.savedFractionX(self.context))
+            fy = float(service.savedFractionY(self.context))
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug(f"float position unavailable: {exc}")
+            return None
+        if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
+            return fx, fy
+        return None
+
     def float_start(self, size_dp: int = 58, color: str = "cyan",
-                    style: str = "liquid") -> Dict[str, Any]:
+                    style: str = "liquid",
+                    fraction: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
         if not self.available:
             return {"ok": False, "error": "The floating orb requires Android"}
         if not self.overlay_granted():
@@ -2827,6 +2856,11 @@ class AndroidBridge:
             intent.putExtra("sphere_primary", int(sphere_rgb_int(primary)))
             intent.putExtra("sphere_glow", int(sphere_rgb_int(glow)))
             intent.putExtra("sphere_style", int(sphere_style_index(style)))
+            if fraction is not None:
+                fx, fy = float(fraction[0]), float(fraction[1])
+                if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0:
+                    intent.putExtra("bubble_fx", fx)
+                    intent.putExtra("bubble_fy", fy)
             BuildVersion = self.autoclass("android.os.Build$VERSION")
             if int(BuildVersion.SDK_INT) >= 26:
                 self.context.startForegroundService(intent)
@@ -3577,6 +3611,15 @@ class PiperBackend(SpeechBackend):
             voices.setdefault(voice["lang"], voice["path"])
         return voices
 
+    def supports_lang(self, lang: str) -> bool:
+        """True only when a voice for this exact language is installed."""
+        language = str(lang or "").strip().lower()
+        if not language:
+            return False
+        if self.selected_path and self.selected_lang == language and Path(self.selected_path).exists():
+            return True
+        return language in self.voices
+
     def set_selected(self, path: str, lang: str = "") -> bool:
         """Remember the user's chosen voice for its language."""
         candidate = str(path or "").strip()
@@ -3651,9 +3694,13 @@ class PiperBackend(SpeechBackend):
 
     def speak(self, text: str, lang: str, rate: float, stop_event: threading.Event) -> None:
         model = ""
-        if self.selected_path and self.selected_lang == lang and Path(self.selected_path).exists():
+        language = str(lang or "").strip().lower()
+        if self.selected_path and self.selected_lang == language and Path(self.selected_path).exists():
             model = self.selected_path
-        model = model or self.voices.get(lang) or next(iter(self.voices.values()), "")
+        model = model or self.voices.get(language, "")
+        # Never feed text to a voice from another language: Arabic read by an
+        # English model is unintelligible. The engine routes such utterances
+        # to the system voice instead.
         if not model or not self.available:
             return
         output = PRIVATE_DIR / "cache" / f"tts_{uuid.uuid4().hex[:8]}.wav"
@@ -3756,6 +3803,7 @@ class SpeechEngine:
         self._buffer_lang = "en"
         self._worker: Optional[threading.Thread] = None
         self._lock = threading.RLock()
+        self._warned_langs: set = set()
         self.piperian = PiperBackend()
         self.piperian.set_selected(
             getattr(config, "piper_voice", ""), getattr(config, "piper_voice_lang", "")
@@ -3797,6 +3845,16 @@ class SpeechEngine:
     def available(self) -> bool:
         return self.backend.available
 
+    def _backend_for(self, lang: str) -> Optional[SpeechBackend]:
+        """Route one sentence to a backend with a voice for its language."""
+        backend = self.backend
+        if isinstance(backend, PiperBackend) and not backend.supports_lang(lang):
+            for candidate in (self.android, self.desktop):
+                if candidate is not None and candidate is not backend and candidate.available:
+                    return candidate
+            return None
+        return backend
+
     def _start_worker(self) -> None:
         def worker() -> None:
             while True:
@@ -3814,10 +3872,19 @@ class SpeechEngine:
                 if self.on_state:
                     with contextlib.suppress(Exception):
                         self.on_state("speaking")
-                try:
-                    self.backend.speak(text, lang, rate, self._stop_event)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning(f"tts backend error: {exc}")
+                backend = self._backend_for(lang)
+                if backend is None:
+                    if lang not in self._warned_langs:
+                        self._warned_langs.add(lang)
+                        LOG.warning(
+                            f"tts: no voice for '{lang}'; install a Piper voice "
+                            "for that language or enable system TTS"
+                        )
+                else:
+                    try:
+                        backend.speak(text, lang, rate, self._stop_event)
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning(f"tts backend error: {exc}")
                 self._queue.task_done()
                 if self._queue.empty() and self.on_state:
                     with contextlib.suppress(Exception):
@@ -10901,6 +10968,8 @@ class DraggableOrb(Widget):
         self._label.size = self.size
 
     def on_touch_down(self, touch: Any) -> bool:
+        if self.disabled or self.opacity <= 0:
+            return False
         if not self.collide_point(*touch.pos):
             return False
         self._touch_origin = (touch.x, touch.y, self.x, self.y)
@@ -13060,6 +13129,17 @@ class ModelsScreen(ScreenBase):
             panel.add_widget(test_btn)
             self.list_box.add_widget(panel)
 
+        if voices and not any(str(voice.get("lang", "")).lower() == "ar" for voice in voices):
+            self.list_box.add_widget(WrapLabel(
+                text=shape_text(T(
+                    "No Arabic Piper voice yet: Arabic replies use the system voice. "
+                    "Add ar_JO-kareem-low.onnx from rhasspy/piper-voices for Arabic Piper output.",
+                    "لا يوجد صوت Piper عربي بعد: تُنطق الردود العربية بصوت النظام. "
+                    "أضف ar_JO-kareem-low.onnx من rhasspy/piper-voices لإخراج Piper بالعربية.",
+                )),
+                font_size=sp(7.4), color=_rgba(self.palette["dim"]),
+            ))
+
         load = NeonButton(self.palette, text=T("Load selected model now", "تحميل النموذج المحدد الآن"), size_hint_y=None, height=dp(36))
         load.bind(on_release=lambda *_: self.load_model())
         self.list_box.add_widget(load)
@@ -13216,10 +13296,18 @@ class ModelsScreen(ScreenBase):
         name = str(voice.get("name") or Path(path).stem)
         if not piper.available:
             self.refresh()
-            self.app.toast(T(
-                f"Saved as the assistant voice: {name}. Piper needs its binary and an audio player to speak. {piper.status}",
-                f"حُفظ كصوت المساعد: {name}. يحتاج Piper إلى ملفه التنفيذي ومشغّل صوت للنطق. {piper.status}",
-            ), 7)
+            if IS_ANDROID:
+                self.app.toast(T(
+                    f"Voice saved: {name}. Android cannot run Piper without a native build, "
+                    f"so replies use the system voice. {piper.status}",
+                    f"حُفظ الصوت: {name}. لا يستطيع أندرويد تشغيل Piper دون نسخة أصلية، "
+                    f"لذا تُنطق الردود بصوت النظام. {piper.status}",
+                ), 7)
+            else:
+                self.app.toast(T(
+                    f"Voice saved: {name}. Piper needs its binary and an audio player to speak. {piper.status}",
+                    f"حُفظ الصوت: {name}. يحتاج Piper إلى ملفه التنفيذي ومشغّل صوت للنطق. {piper.status}",
+                ), 7)
             return
         config.set("tts_voice", "piper")
 
@@ -14182,15 +14270,13 @@ class BoshraApp(App):
         self._asset_capabilities: Dict[str, bool] = {}
         self._startup_asset_guard()
         self._all_files_pending = False
-        # Fullscreen Android ignores adjustResize, so Kivy's own resize mode
-        # never fires. Lift the layout manually from keyboard_height instead.
-        self._kb_height = 0
-        Window.softinput_mode = ""
-        with contextlib.suppress(Exception):
-            Window.bind(keyboard_height=self._on_kb_height)
+        # Android only honours adjustResize outside immersive fullscreen, so the
+        # window stays windowed (buildozer fullscreen = 0) and Kivy shrinks the
+        # viewport to keep the composer above the keyboard.
         if IS_ANDROID:
             with contextlib.suppress(Exception):
-                Window.fullscreen = "auto"
+                Window.fullscreen = False
+                Window.softinput_mode = "resize"
         else:
             with contextlib.suppress(Exception):
                 screen_width, screen_height = Window.system_size
@@ -14227,6 +14313,8 @@ class BoshraApp(App):
         global BUTTON_STYLE
         BUTTON_STYLE = self.core.config.button_style
         self._refresh_insets()
+        if IS_ANDROID:
+            self.core.bridge.set_soft_input_resize()
         self._float_state = self.core.bridge.float_status()
         self._float_running = bool(self._float_state.get("running"))
         self._insets_event = Clock.schedule_interval(self._refresh_insets_safe, 6.0)
@@ -14488,6 +14576,7 @@ class BoshraApp(App):
             desired = False
         if not granted:
             if running:
+                self._adopt_float_position()
                 self.core.bridge.float_stop()
                 running = False
             self._float_running = False
@@ -14496,18 +14585,22 @@ class BoshraApp(App):
             return
         if desired and not running:
             outcome = self.core.bridge.float_start(
-                58, self.core.config.sphere_color, self.core.config.sphere_style
+                58, self.core.config.sphere_color, self.core.config.sphere_style,
+                self._orb_display_fraction(),
             )
             if outcome.get("ok"):
                 running = True
             else:
                 LOG.warning(f"float start failed: {outcome.get('error')}")
         elif running and not desired:
+            self._adopt_float_position()
             self.core.bridge.float_stop()
             running = False
         self._float_running = running
         self._mini_visible = desired and not running
         self._apply_orb_visibility()
+        if running:
+            self._adopt_float_position()
 
     def _request_shared_storage_access(self) -> None:
         """Open Android's all-files grant once when /sdcard/assets is unreadable."""
@@ -14657,14 +14750,6 @@ class BoshraApp(App):
         if getattr(self, "_insets_changed", False) and hasattr(self, "_root"):
             self.update_layout()
 
-    def _on_kb_height(self, _window: Any, height: Any) -> None:
-        try:
-            kb_height = int(height or 0)
-        except (TypeError, ValueError):
-            kb_height = 0
-        self._kb_height = max(0, kb_height)
-        self.update_layout()
-
     def update_layout(self, *_args: Any) -> None:
         if not hasattr(self, "_root") or self._root is None:
             return
@@ -14678,11 +14763,6 @@ class BoshraApp(App):
         tall = usable_height >= dp(790)
         header_h = dp(50 if compact else (62 if tall else 56))
         nav_h = dp(64 if compact else (86 if tall else 76))
-        # Keep at least one text row visible above the keyboard.
-        kb_height = int(getattr(self, "_kb_height", 0) or 0)
-        if kb_height > 0:
-            room = int(height - safe_top - header_h - nav_h - dp(80))
-            safe_bottom += max(0, min(kb_height, room))
         telem_w = dp(94) if width < dp(360) else dp(112)
         frame_w = dp(2)
         host_top = height - safe_top - header_h
@@ -14749,6 +14829,48 @@ class BoshraApp(App):
         self._place_orb()
         self._apply_orb_visibility()
 
+    def _screen_metrics(self) -> Tuple[float, float, int, int]:
+        """Window size plus the status/nav bars that sit outside it, in pixels."""
+        width, height = self._root.size
+        insets = getattr(self, "_insets", {}) or {}
+        status = max(0, int(insets.get("status_bar") or 0))
+        nav = max(0, int(insets.get("nav_bar") or 0))
+        return width, height, status, nav
+
+    def _orb_display_fraction(self) -> Optional[Tuple[float, float]]:
+        """Orb centre as fractions of the whole display (top-left origin)."""
+        orb = getattr(self, "float_orb", None)
+        if orb is None or not hasattr(self, "_root"):
+            return None
+        width, height, status, nav = self._screen_metrics()
+        if width <= 1 or height <= 1:
+            return None
+        screen_height = float(height + status + nav)
+        return (clamp(orb.center_x / width, 0.0, 1.0),
+                clamp((status + height - orb.center_y) / screen_height, 0.0, 1.0))
+
+    def _adopt_float_position(self) -> None:
+        """Mirror the overlay bubble's last position onto the in-app orb."""
+        if not IS_ANDROID:
+            return
+        orb = getattr(self, "float_orb", None)
+        if orb is None:
+            return
+        position = self.core.bridge.float_position()
+        if position is None:
+            return
+        width, height, status, nav = self._screen_metrics()
+        if width <= 1 or height <= 1:
+            return
+        screen_height = float(height + status + nav)
+        x = int(round(position[0] * width - orb.width * 0.5))
+        y = int(round(height - (position[1] * screen_height - status) - orb.height * 0.5))
+        saved = self.core.store.state_get("float:pos", "")
+        if saved == f"{x},{y}":
+            return
+        self.core.store.state_set("float:pos", f"{x},{y}")
+        self._place_orb(initial=True)
+
     def _place_orb(self, initial: bool = False) -> None:
         orb = getattr(self, "float_orb", None)
         if orb is None or not hasattr(self, "_root"):
@@ -14781,7 +14903,9 @@ class BoshraApp(App):
         if getattr(self, "_float_running", False):
             visible = False
         orb.opacity = 1 if visible else 0
-        orb.size = (dp(54), dp(54)) if visible else (dp(1), dp(1))
+        orb.disabled = not visible
+        # Keep the real size while hidden so saved coordinates stay meaningful.
+        orb.size = (dp(54), dp(54))
 
     def toggle_float(self) -> None:
         config = self.core.config
@@ -14799,6 +14923,7 @@ class BoshraApp(App):
                     ), 6)
                     return
                 if status.get("running"):
+                    self._adopt_float_position()
                     outcome = self.core.bridge.float_stop()
                     self._float_running = False
                     config.set("float_enabled", False)
@@ -14807,7 +14932,8 @@ class BoshraApp(App):
                     self.toast(str(outcome.get("message") or outcome.get("error") or ""), 3.5)
                 else:
                     outcome = self.core.bridge.float_start(
-                        58, config.sphere_color, config.sphere_style
+                        58, config.sphere_color, config.sphere_style,
+                        self._orb_display_fraction(),
                     )
                     if outcome.get("ok"):
                         self._float_running = True
