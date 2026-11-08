@@ -9419,42 +9419,50 @@ def _font_pairs() -> Iterator[Tuple[Path, Optional[Path]]]:
         yield regular, bold if _is_file(bold) else None
 
 
-def register_fonts() -> None:
-    """Register the UI font, always leaving ``FONT`` bound to a usable family.
 
-    The previous version returned early when the bundled font was absent, but
-    widgets still requested the custom family, producing
-    ``Label: File 'Boshra.ttf' not found``. Now the family is only advertised
-    after a real file was registered; otherwise ``FONT`` switches to Kivy's
-    built-in Roboto.
-    """
-    global FONT
-    family = "Boshra"
-    pair = next(_font_pairs(), None)
-    if pair is None:
-        FONT = "Roboto"
-        LOG.warning("no usable font file found; using Kivy's built-in Roboto")
-        return
-    regular, bold = pair
+
+
+
+def _font_readable(p: Path) -> bool:
     try:
-        LabelBase.register(
-            name=family,
-            fn_regular=str(regular),
-            fn_bold=str(bold or regular),
-        )
-        FONT = family
-    except Exception as exc:  # noqa: BLE001
-        FONT = "Roboto"
-        LOG.error("custom font registration failed; using Kivy Roboto", exc)
-        return
-    with contextlib.suppress(Exception):
-        # Keep Kivy's default family consistent with the selected font.
-        LabelBase.register(
-            name="Roboto",
-            fn_regular=str(regular),
-            fn_bold=str(bold or regular),
-        )
-    LOG.info(f"UI font: {regular}")
+        with open(p, "rb") as f:
+            return f.read(4) in (b"\x00\x01\x00\x00", b"true", b"OTTO", b"ttcf")
+    except Exception:
+        return False
+
+
+def register_fonts() -> None:
+    from kivy.resources import resource_find
+
+    packaged = Path(__file__).resolve().parent / "assets" / "fonts"
+    pairs = [
+        (packaged / "DejaVuSans.ttf", packaged / "DejaVuSans-Bold.ttf"),
+        (Path("/system/fonts/NotoNaskhArabic-Regular.ttf"),
+         Path("/system/fonts/NotoNaskhArabic-Bold.ttf")),
+        (Path("/system/fonts/NotoSansArabic-Regular.ttf"),
+         Path("/system/fonts/NotoSansArabic-Bold.ttf")),
+        (Path("/system/fonts/DroidSansArabic.ttf"),
+         Path("/system/fonts/DroidSansArabic.ttf")),
+    ]
+    for regular, bold in pairs:
+        if not _font_readable(regular):
+            continue
+        if not _font_readable(bold):
+            bold = regular
+        try:
+            LabelBase.register(name=FONT, fn_regular=str(regular), fn_bold=str(bold))
+            LabelBase.register(name="Roboto", fn_regular=str(regular), fn_bold=str(bold))
+            return
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("font registration failed", exc)
+
+    LOG.warning("no usable font found; using Kivy default font")
+    reg = resource_find("data/fonts/Roboto-Regular.ttf")
+    bld = resource_find("data/fonts/Roboto-Bold.ttf") or reg
+    if reg:
+        LabelBase.register(name=FONT, fn_regular=reg, fn_bold=bld)
+
+
 
 
 def T(en: str, ar: str) -> str:
