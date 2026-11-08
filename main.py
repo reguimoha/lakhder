@@ -2888,25 +2888,26 @@ class AndroidBridge:
             return 0
 
     def ime_height(self) -> int:
-        """Visible software-keyboard height in pixels; 0 when it is hidden."""
+        """Visible software-keyboard height in pixels; 0 when it is hidden.
+
+        Measured from the visible display frame, which stays correct under
+        ADJUST_NOTHING on every Android version (the WindowInsets IME API
+        often reports 0 when the window is not edge-to-edge).
+        """
         if not self.available:
             return 0
         try:
             decor = self.activity.getWindow().getDecorView()
-            sdk = int(self.autoclass("android.os.Build$VERSION").SDK_INT)
-            if sdk >= 30:
-                insets = decor.getRootWindowInsets()
-                if insets is None:
-                    return 0
-                ime_type = self.autoclass("android.view.WindowInsets$Type").ime()
-                return max(0, int(insets.getInsets(ime_type).bottom))
-            # Android 10 and older: the visible frame shrinks by the IME and
-            # the navigation bar, so remove the bar before reporting.
             visible = self.autoclass("android.graphics.Rect")()
             decor.getWindowVisibleDisplayFrame(visible)
-            height = int(decor.getRootView().getHeight())
+            full = int(decor.getRootView().getHeight())
             nav = self._dimen_px("navigation_bar_height")
-            return max(0, height - int(visible.bottom) - nav)
+            height = full - int(visible.bottom)
+            # The bottom gap includes the navigation bar when it is drawn
+            # over the app; only the part above it is the keyboard.
+            if height > nav:
+                height -= nav
+            return max(0, height)
         except Exception as exc:  # noqa: BLE001
             LOG.debug(f"ime height unavailable: {exc}")
             return 0
@@ -4385,6 +4386,48 @@ class DesktopAudioSource(AudioSource):
         self.available = False
 
 
+class _AndroidVoskShim:
+    """Vosk via the official ``vosk-android`` AAR (org.vosk) through Pyjnius.
+
+    Mirrors the part of the Python ``vosk`` API that VoiceEngine uses, so the
+    desktop-only pip package is not required on Android.
+    """
+
+    def __init__(self) -> None:
+        from jnius import autoclass  # type: ignore
+
+        self._ModelCls = autoclass("org.vosk.Model")
+        self._RecognizerCls = autoclass("org.vosk.Recognizer")
+
+    def Model(self, path: str) -> Any:  # noqa: N802
+        return self._ModelCls(str(path))
+
+    def KaldiRecognizer(self, model: Any, rate: float) -> Any:  # noqa: N802
+        return _AndroidKaldiRecognizer(self._RecognizerCls(model, float(rate)))
+
+
+class _AndroidKaldiRecognizer:
+    def __init__(self, recognizer: Any) -> None:
+        self._rec = recognizer
+
+    def SetWords(self, enabled: bool) -> None:  # noqa: N802
+        with contextlib.suppress(Exception):
+            self._rec.setWords(bool(enabled))
+
+    def AcceptWaveform(self, data: bytes) -> bool:  # noqa: N802
+        try:
+            return bool(self._rec.acceptWaveForm(data, len(data)))
+        except Exception:  # noqa: BLE001 - retry with explicit signed bytes
+            signed = [b - 256 if b > 127 else b for b in data]
+            return bool(self._rec.acceptWaveForm(signed, len(signed)))
+
+    def Result(self) -> str:  # noqa: N802
+        return str(self._rec.getResult())
+
+    def PartialResult(self) -> str:  # noqa: N802
+        return str(self._rec.getPartialResult())
+
+
 class VoiceEngine:
     """Wake-word + command recognition. Foreground only; no hidden recording."""
 
@@ -4418,6 +4461,19 @@ class VoiceEngine:
             self._vosk = None
             self._vosk_error = f"{type(exc).__name__}: {exc}"
             LOG.warning(f"vosk import failed: {self._vosk_error}")
+            if IS_ANDROID:
+                # The pip package has no Android build; use vosk-android (AAR).
+                try:
+                    self._vosk = _AndroidVoskShim()
+                    self._vosk_error = ""
+                    LOG.info("Vosk: using vosk-android (org.vosk) backend")
+                except Exception as exc2:  # noqa: BLE001
+                    self._vosk = None
+                    self._vosk_error = (
+                        f"vosk-android AAR not packaged ({type(exc2).__name__}: {exc2}); "
+                        "add it to android.gradle_dependencies and rebuild"
+                    )
+                    LOG.warning(self._vosk_error)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._source: Optional[AudioSource] = None
@@ -15686,9 +15742,7 @@ class BoshraApp(App):
         if IS_ANDROID:
             with contextlib.suppress(Exception):
                 Window.fullscreen = False
-                # Keeps SDL from panning the surface; the inset poll below is
-                # what actually moves the composer.
-                Window.softinput_mode = "resize"
+                # The bridge sets ADJUST_NOTHING; the IME poll moves the composer.
         else:
             with contextlib.suppress(Exception):
                 screen_width, screen_height = Window.system_size
