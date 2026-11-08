@@ -14,10 +14,13 @@ source.dir = .
 
 # (list) File extensions to package into the APK.
 # gguf/onnx removed: large models bloat the APK. Download them to app storage at first run instead.
-source.include_exts = py,pyc,png,jpg,kv,atlas,onnx,json,bin,param,mp3,wav,ttf,ttc,db,txt,pdf,docx,conf,mdl,txt,am,tree
+source.include_exts = py,python3,kivy,vosk,pyc,png,jpg,kv,atlas,onnx,json,bin,param,mp3,wav,ttf,ttc,db,txt,pdf,docx,conf,mdl,txt,am,tree,libffi,requests
 
 #source.include_exts = py,pyc,png,jpg,kv,atlas,json,mp3,wav,ttf,ttc,db,txt,pdf,docx
 
+
+# vosk-android + JNA provide org.vosk.* (do NOT add the pip "vosk" package)
+android.gradle_dependencies = com.alphacephei:vosk-android:0.3.47, net.java.dev.jna:jna:5.13.0@aar
 
 # (list) Patterns to include (assets folder)
 source.include_patterns = assets/*
