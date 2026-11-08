@@ -102,7 +102,7 @@ def _resolve_private_dir() -> Path:
         base = (
             os.environ.get("ANDROID_PRIVATE")
             or os.environ.get("ANDROID_APP_PATH")
-            or "/data/data/org.boshra.boshra/files"
+            or "/data/data/org.bochra.bochra/files"
         )
         return Path(base)
     override = os.environ.get("BOSHRA_HOME")
@@ -280,14 +280,40 @@ def _asset_creation_roots() -> List[Path]:
     if saved is not None:
         candidates.append(saved)
     if IS_ANDROID:
-        # Always target the shared drop folder; mkdir failures (missing mount
-        # or denied permission) are skipped so packaged storage is the backup.
+        # Shared storage is the documented drop point, but it is read-only for
+        # the app until the all-files grant is enabled. App-private storage is
+        # the reliable fallback and survives app updates.
         candidates.append(Path("/sdcard/assets"))
-        candidates.append(ASSETS_DIR)
         candidates.append(PRIVATE_DIR / "assets")
+        candidates.append(ASSETS_DIR)
     else:
         candidates.append(ASSETS_DIR)
     return _dedupe_paths(candidates) or [ASSETS_DIR]
+
+
+def asset_write_roots() -> List[Path]:
+    """Every root a downloaded asset may be written to, best first."""
+    roots = _asset_creation_roots()
+    if IS_ANDROID:
+        roots = roots + [Path("/storage/emulated/0/assets"), PRIVATE_DIR / "assets", ASSETS_DIR]
+    return _dedupe_paths(roots) or [ASSETS_DIR]
+
+
+def probe_writable(folder: Path) -> bool:
+    """True only when ``folder`` exists and a real write succeeds.
+
+    ``mkdir(exist_ok=True)`` succeeds on existing but restricted folders (for
+    example ``/sdcard/assets`` on Android 11+ before the all-files grant), so a
+    probe file is the only reliable test used before saving a download there.
+    """
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        handle, probe = tempfile.mkstemp(dir=str(folder), prefix=".boshra-write-")
+        os.close(handle)
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
 
 
 def ensure_asset_dirs() -> Dict[str, Path]:
@@ -296,9 +322,7 @@ def ensure_asset_dirs() -> Dict[str, Path]:
     for root in _asset_creation_roots():
         for name in (*ASSET_NAMES, "fonts"):
             folder = root / name
-            try:
-                folder.mkdir(parents=True, exist_ok=True)
-            except OSError:
+            if not probe_writable(folder):
                 continue
             created.setdefault(name, folder)
     return created
@@ -2835,18 +2859,57 @@ class AndroidBridge:
         return None
 
     # -- window insets / responsive shell -------------------------------
-    def set_soft_input_resize(self) -> None:
-        """Ask Android to resize the activity (not pan it) when the IME opens."""
+    def set_soft_input_manual(self) -> None:
+        """Keep the window fixed; the app shifts its layout above the IME.
+
+        SDL2 does not implement ``Window.softinput_mode = "resize"`` on Android
+        (Kivy's own source says the Java bootstrap would need a different root
+        layout), so ADJUST_RESIZE/PAN cannot be relied on. ADJUST_NOTHING keeps
+        the surface at full height while :meth:`ime_height` reports the keyboard
+        inset that the app subtracts from its own layout.
+        """
         if not self.available:
             return
         try:
             LayoutParams = self.autoclass("android.view.WindowManager$LayoutParams")
             self.activity.getWindow().setSoftInputMode(
-                LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                LayoutParams.SOFT_INPUT_ADJUST_NOTHING
                 | LayoutParams.SOFT_INPUT_STATE_UNCHANGED
             )
         except Exception as exc:  # noqa: BLE001
-            LOG.warning(f"soft input resize failed: {exc}")
+            LOG.warning(f"soft input mode failed: {exc}")
+
+    def _dimen_px(self, name: str) -> int:
+        try:
+            resources = self.context.getResources()
+            identifier = resources.getIdentifier(name, "dimen", "android")
+            return int(resources.getDimensionPixelSize(identifier)) if identifier else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def ime_height(self) -> int:
+        """Visible software-keyboard height in pixels; 0 when it is hidden."""
+        if not self.available:
+            return 0
+        try:
+            decor = self.activity.getWindow().getDecorView()
+            sdk = int(self.autoclass("android.os.Build$VERSION").SDK_INT)
+            if sdk >= 30:
+                insets = decor.getRootWindowInsets()
+                if insets is None:
+                    return 0
+                ime_type = self.autoclass("android.view.WindowInsets$Type").ime()
+                return max(0, int(insets.getInsets(ime_type).bottom))
+            # Android 10 and older: the visible frame shrinks by the IME and
+            # the navigation bar, so remove the bar before reporting.
+            visible = self.autoclass("android.graphics.Rect")()
+            decor.getWindowVisibleDisplayFrame(visible)
+            height = int(decor.getRootView().getHeight())
+            nav = self._dimen_px("navigation_bar_height")
+            return max(0, height - int(visible.bottom) - nav)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug(f"ime height unavailable: {exc}")
+            return 0
 
     def window_insets(self) -> Dict[str, int]:
         """Return safe-area and system bar sizes in pixels (0 on desktop)."""
@@ -3269,9 +3332,26 @@ class LlamaCppEngine:
             if self._model is not None:
                 self.available = True
                 return True
+            model = Path(self.model_path or "")
+            if not model.is_file():
+                self.status = f"model file missing: {self.model_path or '(none)'}"
+                return False
+            if not os.access(model, os.R_OK):
+                self.status = (
+                    f"model not readable: {model.name}. Grant all-files access for "
+                    "/sdcard/assets, then tap Scan."
+                )
+                return False
             try:
                 from llama_cpp import Llama  # type: ignore
-
+            except Exception as exc:  # noqa: BLE001
+                self._model = None
+                self.available = False
+                detail = str(exc).strip() or type(exc).__name__
+                self.status = f"llama_cpp module missing from this APK: {detail}"
+                LOG.error("llama_cpp import failed", exc)
+                return False
+            try:
                 started = time.time()
                 self._model = Llama(
                     model_path=self.model_path,
@@ -3289,7 +3369,12 @@ class LlamaCppEngine:
             except Exception as exc:  # noqa: BLE001
                 self._model = None
                 self.available = False
-                self.status = f"llama.cpp unavailable: {exc}"
+                detail = str(exc).strip() or type(exc).__name__
+                low = detail.lower()
+                if "dlopen" in low or "cannot locate symbol" in low or "library" in low:
+                    self.status = f"llama.cpp native library failed to load: {detail}"
+                else:
+                    self.status = f"llama.cpp unavailable: {detail}"
                 LOG.error("llama load failed", exc)
                 return False
 
@@ -3693,6 +3778,14 @@ class PiperBackend(SpeechBackend):
             self.available = True
             langs = ", ".join(sorted(self.voices))
             self.status = f"Piper ready ({langs}); player {Path(self.player).name}"
+        elif IS_ANDROID:
+            # Piper ships desktop executables; /sdcard is mounted noexec and the
+            # APK has no aplay/paplay. Android speaks with its system voice.
+            if self.voices:
+                self.status = (f"{len(self.voices)} Piper voice(s) found; "
+                               "Android speaks with the system voice")
+            else:
+                self.status = "Android speaks with the system voice (Piper is desktop-only)"
         else:
             missing = []
             if not self.binary:
@@ -4316,12 +4409,15 @@ class VoiceEngine:
         self.on_error = on_error
         self.models = discover_vosk_models()
         self._vosk = None
+        self._vosk_error = ""
         try:
             import vosk  # type: ignore
 
             self._vosk = vosk
-        except ImportError:
+        except Exception as exc:  # noqa: BLE001
             self._vosk = None
+            self._vosk_error = f"{type(exc).__name__}: {exc}"
+            LOG.warning(f"vosk import failed: {self._vosk_error}")
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._source: Optional[AudioSource] = None
@@ -4337,9 +4433,15 @@ class VoiceEngine:
     def status(self) -> str:
         parts = []
         if self._vosk is None:
-            parts.append("vosk module missing")
+            detail = f" ({self._vosk_error})" if self._vosk_error else ""
+            parts.append(f"vosk module missing{detail}")
         if not self.models:
-            parts.append("no Vosk model folders found")
+            if IS_ANDROID and not self.bridge.has_all_files_access():
+                parts.append(
+                    "no Vosk model found: grant all-files access so /sdcard/assets is readable"
+                )
+            else:
+                parts.append("no Vosk model folders found (expected /sdcard/assets/Vosk-AR and Vosk-EN)")
         if self.models:
             parts.append("models: " + ", ".join(sorted(self.models)))
         return "; ".join(parts) if parts else "ready"
@@ -13995,35 +14097,80 @@ def _safe_extract_tar(archive: Path, destination: Path) -> List[str]:
     return extracted
 
 
+def normalize_download_url(url: str) -> str:
+    """Turn a Hugging Face file page into its direct download endpoint.
+
+    Users copy the address-bar link (``/blob/``), which serves an HTML page and
+    fails GGUF validation; ``/resolve/`` returns the actual file.
+    """
+    value = (url or "").strip()
+    if re.match(r"^https?://(?:www\.)?huggingface\.co/", value, re.IGNORECASE):
+        value = re.sub(r"/blob/", "/resolve/", value, count=1)
+    return value
+
+
+def pick_download_folder(category: str) -> Optional[Path]:
+    """First asset folder (best first) where a download can actually be saved."""
+    if category not in ASSET_NAMES:
+        return None
+    for root in asset_write_roots():
+        folder = root / category
+        if probe_writable(folder):
+            return folder
+    return None
+
+
 def download_model_asset(url: str, category: str,
                          progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
     """Download a model/voice archive from a direct URL into its asset folder."""
     import requests
 
-    url = (url or "").strip()
+    url = normalize_download_url(url)
     if not re.match(r"^https?://", url, re.IGNORECASE):
         return {"ok": False, "error": "Enter a direct http(s) download URL."}
     if category not in ASSET_NAMES:
         return {"ok": False, "error": "Unknown model asset category."}
-    folders = ensure_asset_dirs()
-    destination = folders.get(category)
+    destination = pick_download_folder(category)
     if destination is None:
-        return {"ok": False, "error": "No writable model asset folder is available."}
-    try:
-        destination.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return {"ok": False, "error": f"Cannot create {destination}: {exc}"}
+        return {"ok": False, "error": (
+            "No writable model folder. Grant all-files access for /sdcard/assets, "
+            "or choose a writable assets folder in Settings."
+        )}
     name = Path(urlparse(url).path).name or f"{category}.bin"
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120]
     target = destination / name
-    partial = target.with_suffix(target.suffix + ".part")
+    partial = Path(str(target) + ".part")
+    headers = {"User-Agent": "BoshraAI/4.0"}
+    resume_from = 0
+    with contextlib.suppress(OSError):
+        if partial.exists():
+            resume_from = partial.stat().st_size
+    if resume_from:
+        headers["Range"] = f"bytes={resume_from}-"
     try:
-        with requests.get(url, stream=True, timeout=(20, 120),
-                          headers={"User-Agent": "BoshraAI/4.0"}) as response:
+        with requests.get(url, stream=True, timeout=(30, 300), headers=headers,
+                          allow_redirects=True) as response:
+            if response.status_code == 416 and resume_from:
+                partial.replace(target)
+                return {
+                    "ok": True, "path": str(target), "folder": str(destination),
+                    "extracted": 0, "gguf": [], "voices": [],
+                    "message": f"Already downloaded: {name}",
+                }
             response.raise_for_status()
-            total = int(response.headers.get("Content-Length") or 0)
+            if resume_from and response.status_code != 206:
+                resume_from = 0
+            remaining = int(response.headers.get("Content-Length") or 0)
+            total = remaining + resume_from
+            if remaining and not resume_from:
+                free = shutil.disk_usage(destination).free
+                if remaining > free:
+                    return {"ok": False, "error": (
+                        f"Not enough free space: {human_bytes(remaining)} needed, "
+                        f"{human_bytes(free)} available."
+                    )}
             received = 0
-            with partial.open("wb") as handle:
+            with partial.open("ab" if resume_from else "wb") as handle:
                 for chunk in response.iter_content(chunk_size=512 * 1024):
                     if not chunk:
                         continue
@@ -14031,12 +14178,19 @@ def download_model_asset(url: str, category: str,
                     received += len(chunk)
                     if progress:
                         with contextlib.suppress(Exception):
-                            progress(received, total)
+                            progress(resume_from + received, total)
+            saved = partial.stat().st_size
+            if total and saved < total:
+                return {"ok": False, "error": (
+                    f"Download stopped early: {human_bytes(saved)} of {human_bytes(total)}. "
+                    "Tap Download again to resume."
+                )}
         partial.replace(target)
     except Exception as exc:  # noqa: BLE001
         with contextlib.suppress(OSError):
-            partial.unlink()
-        return {"ok": False, "error": f"Download failed: {exc}"}
+            if partial.exists() and partial.stat().st_size == 0:
+                partial.unlink()
+        return {"ok": False, "error": f"Download failed ({type(exc).__name__}): {exc}"}
 
     lower = name.lower()
     extracted: List[str] = []
@@ -14057,18 +14211,35 @@ def download_model_asset(url: str, category: str,
         if magic != b"GGUF":
             with contextlib.suppress(OSError):
                 target.unlink()
-            return {"ok": False, "error": "The downloaded file is not a valid GGUF model."}
+            return {"ok": False, "error": (
+                "The downloaded file is not a valid GGUF model. Use the direct "
+                "/resolve/ link, not the Hugging Face file page."
+            )}
+
+    sidecar_note = ""
+    if lower.endswith(".onnx"):
+        sidecar = Path(str(target) + ".json")
+        if not sidecar.exists():
+            try:
+                with requests.get(url + ".json", timeout=(20, 60), headers=headers) as config:
+                    if config.ok and config.content:
+                        sidecar.write_bytes(config.content)
+                        sidecar_note = " · voice config fetched"
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug(f"voice config download failed: {exc}")
 
     verified_gguf = [path for path in extracted if path.lower().endswith(".gguf")]
     voices = [path for path in extracted if path.lower().endswith(".onnx")]
     return {
         "ok": True,
         "path": str(target),
+        "folder": str(destination),
         "extracted": len(extracted),
         "gguf": verified_gguf[:4],
         "voices": voices[:8],
         "message": f"Downloaded {name} to {destination}"
-                   + (f" ({len(extracted)} files extracted)" if extracted else ""),
+                   + (f" ({len(extracted)} files extracted)" if extracted else "")
+                   + sidecar_note,
     }
 
 
@@ -14111,6 +14282,14 @@ class ModelsScreen(ScreenBase):
         ])
         self.engine_label = WrapLabel(text="", font_size=sp(8.5), color=_rgba(self.palette["accent"]))
         self.add_widget(self.engine_label)
+        self.access_btn = NeonButton(
+            self.palette, text=T("Grant /sdcard/assets access", "منح الوصول إلى /sdcard/assets"),
+            size_hint_y=None, height=dp(30),
+        )
+        self.access_btn.bind(on_release=lambda *_: self.app.ui_guard(self.app.request_assets_access))
+        self.access_btn.opacity = 0
+        self.access_btn.disabled = not IS_ANDROID
+        self.add_widget(self.access_btn)
         profile_row = self.toolbar(30)
         for name in VALID_PROFILES:
             chip = Chip(self.palette, text=name, height=dp(26))
@@ -14156,10 +14335,21 @@ class ModelsScreen(ScreenBase):
         root = folders.get("phi3").parent if folders.get("phi3") else ASSETS_DIR
         if not self.core.config.assets_path:
             self.core.config.set("assets_path", str(root))
+        access_note = ""
+        access_granted = True
+        if IS_ANDROID:
+            with contextlib.suppress(Exception):
+                access_granted = bool(self.core.bridge.has_all_files_access())
+            access_note = "\n" + T("all-files access: ", "الوصول لكل الملفات: ") + (
+                T("granted", "ممنوح") if access_granted else
+                T("not granted — /sdcard/assets is hidden", "غير ممنوح — /sdcard/assets مخفي")
+            )
+        self.access_btn.opacity = 1 if (IS_ANDROID and not access_granted) else 0
+        self.access_btn.disabled = not (IS_ANDROID and not access_granted)
         self.engine_label.text = shape_text(
             self.core.llm.status + f"\nprofile: {self.core.config.profile} · "
             f"ctx={self.core.resources.profile['n_ctx']} · threads={self.core.resources.profile['n_threads']}\n"
-            + T("assets folder: ", "مجلد الأصول: ") + str(root)
+            + T("assets folder: ", "مجلد الأصول: ") + str(root) + access_note
         )
         self.list_box.clear_widgets()
         self.list_box.add_widget(_label(
@@ -14232,6 +14422,30 @@ class ModelsScreen(ScreenBase):
             T("PIPER VOICES", "أصوات Piper"), self.palette, 9.5, "accent", bold=True,
         )
         self.list_box.add_widget(self.voices_header)
+        if IS_ANDROID:
+            self.list_box.add_widget(WrapLabel(
+                text=shape_text(T(
+                    "Android replies are spoken by the system TTS engine; Piper needs a "
+                    "desktop binary and cannot run from the APK. .onnx voices in "
+                    "/sdcard/assets/piper-tts are still detected for reference.",
+                    "تُنطق ردود أندرويد بمحرك النطق النظامي؛ يحتاج Piper إلى ملف تنفيذي "
+                    "على الحاسب ولا يعمل من داخل APK. تُكتشف أصوات .onnx في "
+                    "/sdcard/assets/piper-tts للعرض فقط.",
+                )),
+                font_size=sp(7.4), color=_rgba(self.palette["dim"]),
+            ))
+            system_test = NeonButton(
+                self.palette, text=T("Test system voice", "اختبار صوت النظام"),
+                size_hint_y=None, height=dp(32),
+            )
+            system_test.bind(
+                on_release=lambda *_: self.app.ui_guard(
+                    lambda: self.test_voice(
+                        {"lang": "ar" if _UI_LANG == "ar" else "en", "path": ""}
+                    )
+                )
+            )
+            self.list_box.add_widget(system_test)
         if not voices:
             self.list_box.add_widget(_label(
                 T("No .onnx voice found in piper-tts.", "لا يوجد صوت .onnx في مجلد piper-tts."),
@@ -14375,8 +14589,10 @@ class ModelsScreen(ScreenBase):
 
         TextPromptModal(
             self.app, T("Download ", "تنزيل ") + label,
-            T("Direct https URL to a .gguf, .onnx, .zip or .tar.gz file",
-              "رابط https مباشر لملف .gguf أو .onnx أو .zip أو .tar.gz"),
+            T("Direct https file URL (.gguf, .onnx, .zip, .tar.gz). "
+              "Hugging Face /blob/ links are converted automatically.",
+              "رابط https مباشر للملف (.gguf أو .onnx أو .zip أو .tar.gz). "
+              "تُحوَّل روابط /blob/ من Hugging Face تلقائياً."),
             start,
         ).open()
 
@@ -14406,10 +14622,30 @@ class ModelsScreen(ScreenBase):
             with contextlib.suppress(Exception):
                 modal.dismiss()
             message = str(result.get("message") or result.get("error") or "")
-            self.app.toast(message, 6)
+            self.app.toast(message, 8 if not result.get("ok") else 6)
+            if result.get("ok"):
+                self._reload_after_download(category)
             self.refresh()
 
         self.app.run_bg(work, done)
+
+    def _reload_after_download(self, category: str) -> None:
+        """Make a freshly downloaded asset usable without restarting the app."""
+        if category == "phi3":
+            self.app.run_bg(
+                lambda: self.core.models.scan(force=True),
+                lambda _result: self.refresh(),
+            )
+            return
+        with contextlib.suppress(Exception):
+            if category.startswith("vosk-"):
+                self.core.voice.models = discover_vosk_models()
+            elif category == "piper-tts":
+                piper = self.core.tts.piperian
+                piper.binary = piper._find_binary()
+                piper.player = piper._find_player()
+                piper.voices = piper._find_voices()
+                piper.available = bool(piper.binary and piper.voices and piper.player)
 
     @staticmethod
     def _set_label(label: WrapLabel, text: str) -> None:
@@ -14474,7 +14710,9 @@ class ModelsScreen(ScreenBase):
         piper = self.core.tts.piperian
 
         def work() -> Any:
-            if piper.binary:
+            # Android cannot execute the desktop Piper binary; go straight to
+            # the system voice instead of surfacing a "binary not found" error.
+            if piper.binary and not IS_ANDROID:
                 wav = piper.synthesize(sample, str(voice.get("path", "")), float(self.core.config.tts_rate))
                 if wav is not None:
                     return {"ok": True, "wav": str(wav)}
@@ -14497,10 +14735,24 @@ class ModelsScreen(ScreenBase):
                 return
             if self.core.tts.available:
                 self.core.tts.speak(sample, str(voice.get("lang") or "en"))
+                if IS_ANDROID:
+                    message = T(
+                        "Playing the test with the Android system voice.",
+                        "يتم تشغيل الاختبار بصوت أندرويد النظامي.",
+                    )
+                else:
+                    message = T(
+                        "Piper binary not found; testing with the system voice instead.",
+                        "لم يُعثر على ملف Piper التنفيذي؛ يتم الاختبار بصوت النظام بدلاً منه.",
+                    )
+                self.app.toast(message, 5)
+            elif IS_ANDROID:
                 self.app.toast(T(
-                    "Piper binary not found; testing with the system voice instead.",
-                    "لم يُعثر على ملف Piper التنفيذي؛ يتم الاختبار بصوت النظام بدلاً منه.",
-                ), 5)
+                    "No speech engine: enable an Android text-to-speech engine, "
+                    "or choose a .onnx voice on desktop.",
+                    "لا يوجد محرك نطق: فعّل محرك النطق في إعدادات أندرويد، "
+                    "أو اختر صوت .onnx على الحاسب.",
+                ), 7)
             else:
                 self.app.toast(T(
                     "Cannot test: add the piper binary, or enable a system TTS engine.",
@@ -15428,12 +15680,14 @@ class BoshraApp(App):
         self._asset_capabilities: Dict[str, bool] = {}
         self._startup_asset_guard()
         self._all_files_pending = False
-        # Android only honours adjustResize outside immersive fullscreen, so the
-        # window stays windowed (buildozer fullscreen = 0) and Kivy shrinks the
-        # viewport to keep the composer above the keyboard.
+        # SDL2 on Android does not resize the Kivy viewport for the IME, so the
+        # window stays fixed and the app reserves the keyboard inset itself.
+        self._ime_height = 0
         if IS_ANDROID:
             with contextlib.suppress(Exception):
                 Window.fullscreen = False
+                # Keeps SDL from panning the surface; the inset poll below is
+                # what actually moves the composer.
                 Window.softinput_mode = "resize"
         else:
             with contextlib.suppress(Exception):
@@ -15472,10 +15726,9 @@ class BoshraApp(App):
         BUTTON_STYLE = self.core.config.button_style
         self._refresh_insets()
         if IS_ANDROID:
-            self.core.bridge.set_soft_input_resize()
+            self.core.bridge.set_soft_input_manual()
         self._float_state = self.core.bridge.float_status()
         self._float_running = bool(self._float_state.get("running"))
-        self._insets_event = Clock.schedule_interval(self._refresh_insets_safe, 6.0)
 
         self._root = FloatLayout()
         self._compose()
@@ -15673,12 +15926,15 @@ class BoshraApp(App):
         self.show_screen(self.current_screen)
         self.update_layout()
         self._tick_event = Clock.schedule_interval(self.tick, 0.5)
+        self._insets_event = Clock.schedule_interval(self._refresh_insets_safe, 6.0)
+        if IS_ANDROID:
+            self._ime_event = Clock.schedule_interval(self._poll_ime, 0.25)
         if self._post_rebuild_toast:
             message, self._post_rebuild_toast = self._post_rebuild_toast, ""
             Clock.schedule_once(lambda _dt: self.toast(message), 0.1)
 
     def _cancel_timers(self) -> None:
-        for attr in ("_tick_event", "_accel_event", "_toast_event", "_insets_event"):
+        for attr in ("_tick_event", "_accel_event", "_toast_event", "_insets_event", "_ime_event"):
             event = getattr(self, attr, None)
             if event is not None:
                 with contextlib.suppress(Exception):
@@ -15799,6 +16055,18 @@ class BoshraApp(App):
         LOG.info("all-files access missing; opening system settings for /sdcard/assets")
         with contextlib.suppress(Exception):
             bridge.request_all_files_access()
+
+    def request_assets_access(self) -> None:
+        """Reopen Android's all-files grant from the Models screen."""
+        if not IS_ANDROID:
+            return
+        self._all_files_pending = True
+        with contextlib.suppress(Exception):
+            self.core.bridge.request_all_files_access()
+        self.toast(T(
+            "Enable “All files access” for Boshra, then return to the app.",
+            "فعّل «الوصول إلى كل الملفات» لبشرى ثم عُد إلى التطبيق.",
+        ), 7)
 
     def _rescan_assets_after_resume(self) -> None:
         """Re-check /sdcard/assets after the Settings grant returns to the app."""
@@ -15930,6 +16198,28 @@ class BoshraApp(App):
         if getattr(self, "_insets_changed", False) and hasattr(self, "_root"):
             self.update_layout()
 
+    def _poll_ime(self, _dt: float = 0.0) -> None:
+        """Track the on-screen keyboard and lift the shell above it."""
+        if not IS_ANDROID or not hasattr(self, "_root"):
+            return
+        try:
+            measured = int(self.core.bridge.ime_height())
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug(f"ime poll failed: {exc}")
+            return
+        # Ignore navigation-bar noise: real keyboards are far taller.
+        measured = measured if measured > dp(60) else 0
+        if measured == getattr(self, "_ime_height", 0):
+            return
+        opened = measured > 0 and not getattr(self, "_ime_height", 0)
+        self._ime_height = measured
+        self.update_layout()
+        if opened:
+            chat = self.screens.get("chat")
+            if chat is not None:
+                with contextlib.suppress(Exception):
+                    chat.scroll_bottom()
+
     def update_layout(self, *_args: Any) -> None:
         if not hasattr(self, "_root") or self._root is None:
             return
@@ -15938,7 +16228,9 @@ class BoshraApp(App):
             return
         safe_top = getattr(self, "_safe_top", 0)
         safe_bottom = getattr(self, "_safe_bottom", 0)
-        usable_height = max(dp(200), height - safe_top - safe_bottom)
+        ime_height = max(0, int(getattr(self, "_ime_height", 0) or 0)) if IS_ANDROID else 0
+        bottom_base = safe_bottom + ime_height
+        usable_height = max(dp(200), height - safe_top - bottom_base)
         compact = usable_height < dp(640)
         tall = usable_height >= dp(790)
         header_h = dp(50 if compact else (62 if tall else 56))
@@ -15946,7 +16238,7 @@ class BoshraApp(App):
         telem_w = dp(94) if width < dp(360) else dp(112)
         frame_w = dp(2)
         host_top = height - safe_top - header_h
-        host_height = max(dp(80), host_top - nav_h - safe_bottom)
+        host_height = max(dp(80), host_top - nav_h - bottom_base)
 
         if getattr(self, "background", None) is not None:
             self.background.pos = (0, 0)
@@ -15958,7 +16250,7 @@ class BoshraApp(App):
         self.header.pos = (0, height - safe_top - header_h)
         self.header.size = (width, header_h)
 
-        self.nav_grid.pos = (0, safe_bottom)
+        self.nav_grid.pos = (0, bottom_base)
         self.nav_grid.size = (width, nav_h)
 
         chat_mode = self.current_screen == "chat"
@@ -15974,7 +16266,7 @@ class BoshraApp(App):
             self.telemetry.opacity = 0
 
         host_x = frame_w if (chat_mode or not telem_visible) else telem_w + dp(10)
-        self.host.pos = (host_x, safe_bottom + nav_h)
+        self.host.pos = (host_x, bottom_base + nav_h)
         self.host.size = (max(dp(80), width - host_x - frame_w), host_height)
 
         if chat_mode:
@@ -15997,7 +16289,7 @@ class BoshraApp(App):
             center_x = width * 0.5
             center_y = safe_top + (height - safe_top) * 0.80
             center_y = min(center_y, host_top - diameter * 0.5 - dp(3))
-            center_y = max(center_y, safe_bottom + nav_h + diameter * 0.5 + dp(3))
+            center_y = max(center_y, bottom_base + nav_h + diameter * 0.5 + dp(3))
         self.sphere_touch.size = (diameter, diameter)
         self.sphere_touch.pos = (center_x - diameter * 0.5, center_y - diameter * 0.5)
         orb = getattr(self, "living_orb", None)
@@ -16012,7 +16304,7 @@ class BoshraApp(App):
         if self.toast_panel is not None:
             toast_width = min(width - dp(16), dp(350))
             self.toast_panel.size = (toast_width, dp(32))
-            self.toast_panel.pos = ((width - toast_width) * 0.5, safe_bottom + nav_h + dp(7))
+            self.toast_panel.pos = ((width - toast_width) * 0.5, bottom_base + nav_h + dp(7))
         self._place_orb()
         self._apply_orb_visibility()
 
@@ -16066,9 +16358,10 @@ class BoshraApp(App):
         if width <= 1 or height <= 1:
             return
         safe_bottom = getattr(self, "_safe_bottom", 0)
+        ime_height = max(0, int(getattr(self, "_ime_height", 0) or 0)) if IS_ANDROID else 0
         nav_height = getattr(getattr(self, "nav_grid", None), "height", 0) or 0
         composer_clear = dp(86) if self.current_screen == "chat" else 0
-        floor_y = safe_bottom + nav_height + composer_clear + dp(8)
+        floor_y = safe_bottom + ime_height + nav_height + composer_clear + dp(8)
         if initial:
             saved = self.core.store.state_get("float:pos", "")
             placed = False
