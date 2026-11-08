@@ -2668,6 +2668,49 @@ class AndroidBridge:
             LOG.warning(f"permission request failed: {exc}")
             return False
 
+    # -- all-files access (Android 11+ scoped storage) ------------------
+    def has_all_files_access(self) -> bool:
+        """True when shared storage such as /sdcard/assets is readable.
+
+        Android 11+ ignores READ/WRITE_EXTERNAL_STORAGE for /sdcard; the user
+        must grant ``MANAGE_EXTERNAL_STORAGE`` from a dedicated Settings page.
+        """
+        if not self.available:
+            return True
+        try:
+            sdk = int(self.autoclass("android.os.Build$VERSION").SDK_INT)
+            if sdk < 30:
+                return self.ensure_permission("READ_EXTERNAL_STORAGE", timeout=1.0)
+            Environment = self.autoclass("android.os.Environment")
+            return bool(Environment.isExternalStorageManager())
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"all-files check failed: {exc}")
+            return False
+
+    def request_all_files_access(self) -> bool:
+        """Open the system page where the all-files grant can be enabled."""
+        if not self.available:
+            return False
+        try:
+            sdk = int(self.autoclass("android.os.Build$VERSION").SDK_INT)
+            if sdk < 30:
+                self.ensure_permission("WRITE_EXTERNAL_STORAGE")
+                return True
+            Intent = self.autoclass("android.content.Intent")
+            Settings = self.autoclass("android.provider.Settings")
+            Uri = self.autoclass("android.net.Uri")
+            try:
+                intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                intent.setData(Uri.parse("package:" + self.context.getPackageName()))
+                self.activity.startActivity(intent)
+            except Exception:
+                self.activity.startActivity(
+                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"all-files request failed: {exc}")
+            return False
+
     def pick_file(self) -> Optional[str]:
         try:
             from plyer import filechooser  # type: ignore
@@ -9372,57 +9415,6 @@ PALETTES: Dict[str, Dict[str, str]] = {
 }
 
 
-def _font_pairs() -> Iterator[Tuple[Path, Optional[Path]]]:
-    """Yield usable (regular, bold-or-None) font pairs in preference order.
-
-    Bundled assets win, then Android system fonts, then the font shipped with
-    Kivy. Every candidate is checked before use, so a missing ``.ttf`` can
-    never reach ``LabelBase.register``.
-    """
-    pairs: List[Tuple[Path, Path]] = []
-    try:
-        font_folders = _asset_folders("fonts", asset_roots())
-    except Exception:  # noqa: BLE001 - asset discovery must not block startup
-        font_folders = []
-    if FONTS_DIR not in font_folders:
-        font_folders.insert(0, FONTS_DIR)
-    for folder in font_folders:
-        pairs.append((folder / "DejaVuSans.ttf", folder / "DejaVuSans-Bold.ttf"))
-        pairs.append((folder / "Boshra.ttf", folder / "Boshra-Bold.ttf"))
-        for font in _scan_files(folder, "*.ttf")[:4]:
-            pairs.append((font, font.with_name(f"{font.stem}-Bold.ttf")))
-    pairs.extend([
-        (Path("/system/fonts/NotoSansArabic-Regular.ttf"),
-         Path("/system/fonts/NotoSansArabic-Bold.ttf")),
-        (Path("/system/fonts/DroidSansArabic.ttf"),
-         Path("/system/fonts/DroidSansArabic-Bold.ttf")),
-        (Path("/system/fonts/Roboto-Regular.ttf"), Path("/system/fonts/Roboto-Bold.ttf")),
-        (Path("/system/fonts/DroidSans.ttf"), Path("/system/fonts/DroidSans-Bold.ttf")),
-        (Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")),
-    ])
-    try:
-        import kivy
-
-        kivy_fonts = Path(kivy.__file__).resolve().parent / "data" / "fonts"
-        pairs.append((kivy_fonts / "Roboto-Regular.ttf", kivy_fonts / "Roboto-Bold.ttf"))
-    except Exception:  # noqa: BLE001 - Kivy is present in practice
-        pass
-    seen: set = set()
-    for regular, bold in pairs:
-        if not _is_file(regular):
-            continue
-        key = str(regular)
-        if key in seen:
-            continue
-        seen.add(key)
-        yield regular, bold if _is_file(bold) else None
-
-
-
-
-
-
 def _font_readable(p: Path) -> bool:
     try:
         with open(p, "rb") as f:
@@ -9432,6 +9424,7 @@ def _font_readable(p: Path) -> bool:
 
 
 def register_fonts() -> None:
+    global FONT
     from kivy.resources import resource_find
 
     packaged = Path(__file__).resolve().parent / "assets" / "fonts"
@@ -9461,6 +9454,9 @@ def register_fonts() -> None:
     bld = resource_find("data/fonts/Roboto-Bold.ttf") or reg
     if reg:
         LabelBase.register(name=FONT, fn_regular=reg, fn_bold=bld)
+    else:
+        # No file-backed family exists; Kivy's built-in name always resolves.
+        FONT = "Roboto"
 
 
 
@@ -14185,7 +14181,13 @@ class BoshraApp(App):
         self._startup_report: Optional[AssetReport] = None
         self._asset_capabilities: Dict[str, bool] = {}
         self._startup_asset_guard()
-        Window.softinput_mode = "resize"
+        self._all_files_pending = False
+        # Fullscreen Android ignores adjustResize, so Kivy's own resize mode
+        # never fires. Lift the layout manually from keyboard_height instead.
+        self._kb_height = 0
+        Window.softinput_mode = ""
+        with contextlib.suppress(Exception):
+            Window.bind(keyboard_height=self._on_kb_height)
         if IS_ANDROID:
             with contextlib.suppress(Exception):
                 Window.fullscreen = "auto"
@@ -14436,7 +14438,9 @@ class BoshraApp(App):
         self.update_chrome_status()
         self.update_telemetry()
         self._start_accelerometer()
-        self._maybe_prompt_assets()
+        self._request_shared_storage_access()
+        if not self._all_files_pending:
+            self._maybe_prompt_assets()
         with contextlib.suppress(Exception):
             self.core.ui_sound.warm_up()
         if self.core.config.float_start_on_launch and not self.core.config.float_enabled:
@@ -14504,6 +14508,74 @@ class BoshraApp(App):
         self._float_running = running
         self._mini_visible = desired and not running
         self._apply_orb_visibility()
+
+    def _request_shared_storage_access(self) -> None:
+        """Open Android's all-files grant once when /sdcard/assets is unreadable."""
+        if self._smoke_mode:
+            return
+        bridge = getattr(self.core, "bridge", None)
+        if bridge is None or not getattr(bridge, "available", False):
+            return
+        try:
+            if bridge.has_all_files_access():
+                return
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"all-files access probe failed: {exc}")
+            return
+        self._all_files_pending = True
+        LOG.info("all-files access missing; opening system settings for /sdcard/assets")
+        with contextlib.suppress(Exception):
+            bridge.request_all_files_access()
+
+    def _rescan_assets_after_resume(self) -> None:
+        """Re-check /sdcard/assets after the Settings grant returns to the app."""
+        previous = dict(getattr(self, "_asset_capabilities", {}))
+        try:
+            folders = ensure_asset_dirs()
+            root = folders.get("phi3").parent if folders.get("phi3") else ASSETS_DIR
+            report = inspect_assets()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"asset rescan failed: {exc}")
+            return
+        self._startup_report = report
+        self._asset_capabilities = {row.key: bool(row.ok) for row in report.statuses}
+        if not self.core.config.assets_path:
+            with contextlib.suppress(Exception):
+                self.core.config.set("assets_path", str(root))
+        gained = sorted(
+            key for key, ok in self._asset_capabilities.items()
+            if ok and not previous.get(key)
+        )
+        lost = sorted(
+            key for key, ok in self._asset_capabilities.items()
+            if not ok and previous.get(key)
+        )
+        access_granted = False
+        with contextlib.suppress(Exception):
+            access_granted = bool(self.core.bridge.has_all_files_access())
+        if gained or lost:
+            LOG.info(f"asset rescan: gained={gained} lost={lost}")
+            for name in ("models", "settings"):
+                screen = self.screens.get(name)
+                if screen is not None:
+                    with contextlib.suppress(Exception):
+                        screen.refresh()
+            if gained:
+                self.toast(T(
+                    "Found models in shared storage: " + ", ".join(gained),
+                    "عُثر على نماذج في التخزين المشترك: " + ", ".join(gained),
+                ), 5)
+        if not getattr(self, "_all_files_pending", False):
+            return
+        self._all_files_pending = False
+        if not access_granted:
+            self.toast(T(
+                "Boshra still cannot read /sdcard/assets. Allow all-files access in Android Settings.",
+                "ما زالت بشرى لا تستطيع قراءة /sdcard/assets. اسمح بالوصول إلى كل الملفات من إعدادات أندرويد.",
+            ), 7)
+        with contextlib.suppress(Exception):
+            if not self._asset_prompt_shown:
+                self._maybe_prompt_assets()
 
     def _maybe_prompt_assets(self) -> None:
         if self._smoke_mode or getattr(self, "_asset_prompt_shown", False):
@@ -14585,6 +14657,14 @@ class BoshraApp(App):
         if getattr(self, "_insets_changed", False) and hasattr(self, "_root"):
             self.update_layout()
 
+    def _on_kb_height(self, _window: Any, height: Any) -> None:
+        try:
+            kb_height = int(height or 0)
+        except (TypeError, ValueError):
+            kb_height = 0
+        self._kb_height = max(0, kb_height)
+        self.update_layout()
+
     def update_layout(self, *_args: Any) -> None:
         if not hasattr(self, "_root") or self._root is None:
             return
@@ -14598,6 +14678,11 @@ class BoshraApp(App):
         tall = usable_height >= dp(790)
         header_h = dp(50 if compact else (62 if tall else 56))
         nav_h = dp(64 if compact else (86 if tall else 76))
+        # Keep at least one text row visible above the keyboard.
+        kb_height = int(getattr(self, "_kb_height", 0) or 0)
+        if kb_height > 0:
+            room = int(height - safe_top - header_h - nav_h - dp(80))
+            safe_bottom += max(0, min(kb_height, room))
         telem_w = dp(94) if width < dp(360) else dp(112)
         frame_w = dp(2)
         host_top = height - safe_top - header_h
@@ -15427,6 +15512,7 @@ class BoshraApp(App):
 
     def on_resume(self) -> bool:
         self._refresh_insets_safe(0)
+        self._rescan_assets_after_resume()
         self.update_chrome_status()
         self.update_telemetry()
         self._sync_float()
