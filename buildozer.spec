@@ -14,7 +14,10 @@ source.dir = .
 
 # (list) File extensions to package into the APK.
 # gguf/onnx removed: large models bloat the APK. Download them to app storage at first run instead.
-source.include_exts = py,pyc,png,jpg,kv,atlas,json,mp3,wav,ttf,ttc,db,txt,pdf,docx
+source.include_exts = py,pyc,png,jpg,kv,atlas,onnx,json,bin,param,mp3,wav,ttf,ttc,db,txt,pdf,docx,conf,mdl,txt,am,tree
+
+#source.include_exts = py,pyc,png,jpg,kv,atlas,json,mp3,wav,ttf,ttc,db,txt,pdf,docx
+
 
 # (list) Patterns to include (assets folder)
 source.include_patterns = assets/*
