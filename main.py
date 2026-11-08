@@ -224,10 +224,11 @@ def asset_roots() -> List[Path]:
 
     user_data = _kivy_user_data_dir()
     if IS_ANDROID:
-        # External storage, then packaged/app-private locations.
-        shared_assets = Path("/sdcard/assets")
-        if shared_assets.exists():
-            candidates.append(shared_assets)
+        # Shared storage is the documented drop point for model files. List it
+        # even before it exists so a fresh install still scans and creates it;
+        # /storage/emulated/0 is the same volume when /sdcard is unavailable.
+        candidates.append(Path("/sdcard/assets"))
+        candidates.append(Path("/storage/emulated/0/assets"))
         android_public = _env_path("ANDROID_PUBLIC")
         if android_public:
             candidates.append(android_public / "assets")
@@ -278,12 +279,9 @@ def _asset_creation_roots() -> List[Path]:
     if saved is not None:
         candidates.append(saved)
     if IS_ANDROID:
-        shared = Path("/sdcard/assets")
-        try:
-            if Path("/sdcard").is_dir():
-                candidates.append(shared)
-        except OSError:
-            pass
+        # Always target the shared drop folder; mkdir failures (missing mount
+        # or denied permission) are skipped so packaged storage is the backup.
+        candidates.append(Path("/sdcard/assets"))
         candidates.append(ASSETS_DIR)
         candidates.append(PRIVATE_DIR / "assets")
     else:
@@ -14258,6 +14256,7 @@ class BoshraApp(App):
             f"asset scan {elapsed:.0f} ms · root={report.root} · "
             + ("all present" if not missing else "missing " + ", ".join(missing))
         )
+        LOG.info("asset roots: " + " | ".join(str(path) for path in report.roots[:8]))
         for key in missing:
             entry = folders.get(key)
             LOG.warning(f"asset '{key}' unavailable; using system fallback"
