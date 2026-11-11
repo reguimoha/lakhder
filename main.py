@@ -2890,18 +2890,41 @@ class AndroidBridge:
     def ime_height(self) -> int:
         """Visible software-keyboard height in pixels; 0 when it is hidden.
 
-        Measured from the visible display frame, which stays correct under
-        ADJUST_NOTHING on every Android version (the WindowInsets IME API
-        often reports 0 when the window is not edge-to-edge).
+        The window runs with ADJUST_NOTHING (see :meth:`set_soft_input_manual`),
+        so the decor view is never resized and ``getWindowVisibleDisplayFrame``
+        keeps reporting the full screen while the keyboard covers it. The IME
+        inset from ``WindowInsets`` is reported regardless of the soft-input
+        mode, so it is the primary source on API 30+ (and the only source of
+        truth on gesture-navigation devices). Older releases fall back to the
+        legacy system insets and finally to the visible display frame.
         """
         if not self.available:
             return 0
         try:
             decor = self.activity.getWindow().getDecorView()
+            nav = self._dimen_px("navigation_bar_height")
+            BuildVersion = self.autoclass("android.os.Build$VERSION")
+            sdk = int(BuildVersion.SDK_INT)
+
+            if sdk >= 30:
+                insets = decor.getRootWindowInsets()
+                if insets is not None:
+                    WindowInsetsType = self.autoclass("android.view.WindowInsets$Type")
+                    ime = int(insets.getInsets(WindowInsetsType.ime()).bottom)
+                    if ime > 0:
+                        return ime
+
+            # API 23-29: the system window insets include the IME when shown.
+            # The navigation bar is part of the same inset, so it is removed.
+            insets = decor.getRootWindowInsets()
+            if insets is not None:
+                height = int(insets.getSystemWindowInsetBottom())
+                if height > nav:
+                    return height - nav
+
             visible = self.autoclass("android.graphics.Rect")()
             decor.getWindowVisibleDisplayFrame(visible)
             full = int(decor.getRootView().getHeight())
-            nav = self._dimen_px("navigation_bar_height")
             height = full - int(visible.bottom)
             # The bottom gap includes the navigation bar when it is drawn
             # over the app; only the part above it is the keyboard.
@@ -3352,32 +3375,54 @@ class LlamaCppEngine:
                 self.status = f"llama_cpp module missing from this APK: {detail}"
                 LOG.error("llama_cpp import failed", exc)
                 return False
-            try:
-                started = time.time()
-                self._model = Llama(
-                    model_path=self.model_path,
-                    n_ctx=int(self.profile["n_ctx"]),
-                    n_threads=int(self.profile["n_threads"]),
-                    n_batch=128,
-                    use_mmap=True,
-                    use_mlock=False,
-                    verbose=False,
-                )
+            profile_ctx = int(self.profile["n_ctx"])
+            attempts = [
+                {"n_ctx": profile_ctx, "n_batch": 128, "use_mmap": True},
+                {"n_ctx": min(profile_ctx, 1024), "n_batch": 64, "use_mmap": False},
+                {"n_ctx": min(profile_ctx, 512), "n_batch": 32, "use_mmap": False},
+            ]
+            last_detail = ""
+            started = time.time()
+            for index, options in enumerate(attempts):
+                try:
+                    self._model = Llama(
+                        model_path=self.model_path,
+                        n_ctx=options["n_ctx"],
+                        n_threads=int(self.profile["n_threads"]),
+                        n_batch=options["n_batch"],
+                        use_mmap=options["use_mmap"],
+                        use_mlock=False,
+                        verbose=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_detail = str(exc).strip() or type(exc).__name__
+                    LOG.error(f"llama load attempt {index + 1} failed", exc)
+                    low = last_detail.lower()
+                    if "dlopen" in low or "cannot locate symbol" in low or "undefined symbol" in low:
+                        break
+                    gc.collect()
+                    continue
                 self.available = True
-                self.status = f"loaded in {time.time() - started:.1f}s · ctx {self.profile['n_ctx']}"
+                self.status = (
+                    f"loaded in {time.time() - started:.1f}s · ctx {options['n_ctx']}"
+                )
                 LOG.info(f"LLM loaded: {Path(self.model_path).name} {self.status}")
                 return True
-            except Exception as exc:  # noqa: BLE001
-                self._model = None
-                self.available = False
-                detail = str(exc).strip() or type(exc).__name__
-                low = detail.lower()
-                if "dlopen" in low or "cannot locate symbol" in low or "library" in low:
-                    self.status = f"llama.cpp native library failed to load: {detail}"
-                else:
-                    self.status = f"llama.cpp unavailable: {detail}"
-                LOG.error("llama load failed", exc)
-                return False
+            self._model = None
+            self.available = False
+            detail = last_detail or "unknown error"
+            low = detail.lower()
+            if "dlopen" in low or "cannot locate symbol" in low or "undefined symbol" in low:
+                self.status = f"llama.cpp native library failed to load: {detail}"
+            elif "allocate" in low or "out of memory" in low or "memory" in low:
+                self.status = (
+                    f"not enough RAM for this model ({detail}). Close other apps, "
+                    "pick a smaller GGUF, or use the heuristic fallback."
+                )
+            else:
+                self.status = f"llama.cpp unavailable: {detail}"
+            LOG.error("llama load failed")
+            return False
 
     def unload(self) -> None:
         with self._lock:
@@ -3695,9 +3740,23 @@ class AndroidTTSBackend(SpeechBackend):
         self.engine = None
         self.ready = threading.Event()
         self.init_status = -1
+        self._init_attempts = 0
+        self._listener = None
+        self._autoclass = None
+        self._TextToSpeech = None
         if not bridge.available:
             self.status = "Android TTS requires Android"
             return
+        # Do not stall startup: speech waits for onInit() and retries there.
+        self._init_engine(wait=0.4)
+
+    def _init_engine(self, wait: float = 2.0) -> bool:
+        """Create the TextToSpeech engine; safe to retry after a slow start."""
+        if not self.bridge.available:
+            return False
+        if self.engine is not None and self.available:
+            return True
+        self._init_attempts += 1
         try:
             from jnius import PythonJavaClass, autoclass, java_method  # type: ignore
 
@@ -3715,23 +3774,47 @@ class AndroidTTSBackend(SpeechBackend):
                     holder.ready.set()
 
             self._listener = _InitListener()
-            self.engine = self._TextToSpeech(bridge.context, self._listener)
-            if self.ready.wait(8.0) and self.init_status == 0:
-                self.available = True
-                self.status = "Android native TextToSpeech ready"
+            self.ready.clear()
+            self.init_status = -1
+            self.engine = self._TextToSpeech(self.bridge.context, self._listener)
+            # The constructor returns immediately; speech is gated on onInit().
+            self.available = True
+            if self.ready.wait(wait):
+                if self.init_status == 0:
+                    self.status = "Android native TextToSpeech ready"
+                else:
+                    self.available = False
+                    self.status = f"TTS init failed (status {self.init_status})"
             else:
-                self.status = f"TTS init failed (status {self.init_status})"
+                self.status = "Android TextToSpeech still initialising"
+            return self.available
         except Exception as exc:  # noqa: BLE001
+            self.available = False
             self.status = f"Android TTS error: {exc}"
             LOG.error("android tts init", exc)
+            return False
+
+    def ensure_ready(self, timeout: float = 2.0) -> bool:
+        if self.available:
+            return True
+        if self._init_attempts >= 3:
+            return False
+        return self._init_engine(wait=timeout)
 
     def speak(self, text: str, lang: str, rate: float, stop_event: threading.Event) -> None:
-        if not self.available or self.engine is None:
+        if not self.ensure_ready() or self.engine is None:
+            return
+        if not self.ready.wait(2.0) or self.init_status != 0:
+            self.status = f"TTS init failed (status {self.init_status})"
+            self.available = False
             return
         try:
             Locale = self._autoclass("java.util.Locale")
             engine = self.engine
-            engine.setLanguage(Locale(lang))
+            # setLanguage returns LANG_MISSING_DATA/LANG_NOT_SUPPORTED (< 0) for
+            # a voice the device does not ship; speaking anyway would be silent.
+            if int(engine.setLanguage(Locale(str(lang or "en")))) < 0:
+                engine.setLanguage(Locale.getDefault())
             engine.setSpeechRate(float(rate))
             utterance = "boshra-" + uuid.uuid4().hex[:8]
             engine.speak(text, self._TextToSpeech.QUEUE_ADD, None, utterance)
@@ -3775,18 +3858,20 @@ class PiperBackend(SpeechBackend):
         self.selected_lang = ""
         self._process: Optional[subprocess.Popen] = None
         self._player_process: Optional[subprocess.Popen] = None
+        self._android_player: Optional[Any] = None
         if self.binary and self.voices and self.player:
             self.available = True
             langs = ", ".join(sorted(self.voices))
-            self.status = f"Piper ready ({langs}); player {Path(self.player).name}"
+            self.status = f"Piper ready ({langs}); player {self._player_label()}"
         elif IS_ANDROID:
-            # Piper ships desktop executables; /sdcard is mounted noexec and the
-            # APK has no aplay/paplay. Android speaks with its system voice.
+            # Piper ships desktop executables; Android needs an arm64 build and
+            # /sdcard is mounted noexec. Voices stay listed and replies fall
+            # back to the system engine.
             if self.voices:
                 self.status = (f"{len(self.voices)} Piper voice(s) found; "
                                "Android speaks with the system voice")
             else:
-                self.status = "Android speaks with the system voice (Piper is desktop-only)"
+                self.status = "Android speaks with the system voice (no Piper binary)"
         else:
             missing = []
             if not self.binary:
@@ -3797,15 +3882,59 @@ class PiperBackend(SpeechBackend):
                 missing.append("audio player")
             self.status = "Piper inactive: missing " + ", ".join(missing)
 
+    def _player_label(self) -> str:
+        return "Android MediaPlayer" if self.player == "android" else Path(self.player).name
+
     @staticmethod
-    def _find_binary() -> str:
+    def _is_arm64_elf(path: Path) -> bool:
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(20)
+        except OSError:
+            return False
+        # ELF64, little endian, e_machine 0xB7 (AArch64).
+        return (len(header) >= 20 and header[:4] == b"\x7fELF"
+                and header[4] == 2 and header[18] == 0xB7)
+
+    @classmethod
+    def _install_local_binary(cls, source: Path) -> str:
+        """Copy a bundled Piper executable into private storage with +x."""
+        if not _is_file(source):
+            return ""
+        if IS_ANDROID and not cls._is_arm64_elf(source):
+            return ""
+        target = PRIVATE_DIR / "piper" / "piper"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or target.stat().st_size != source.stat().st_size:
+                shutil.copyfile(source, target)
+            os.chmod(target, 0o755)
+        except OSError as exc:
+            LOG.warning(f"piper install failed: {exc}")
+            return ""
+        return str(target) if os.access(target, os.X_OK) else ""
+
+    @classmethod
+    def _find_binary(cls) -> str:
         local = PRIVATE_DIR / "piper" / "piper"
         if local.exists() and os.access(local, os.X_OK):
             return str(local)
+        for candidate in (
+            ASSETS_DIR / "piper-tts" / "piper",
+            ASSETS_DIR / "piper-tts" / "bin" / "piper",
+            PRIVATE_DIR / "piper-tts" / "piper",
+        ):
+            installed = cls._install_local_binary(candidate)
+            if installed:
+                return installed
         return shutil.which("piper") or ""
 
     @staticmethod
     def _find_player() -> str:
+        if IS_ANDROID:
+            # Android has no aplay/paplay; the rendered WAV is played through
+            # MediaPlayer with Pyjnius.
+            return "android"
         for name in ("aplay", "paplay", "ffplay"):
             found = shutil.which(name)
             if found:
@@ -3837,7 +3966,7 @@ class PiperBackend(SpeechBackend):
             if self.available:
                 langs = ", ".join(sorted(self.voices))
                 self.status = (f"Piper ready ({langs}); voice {Path(candidate).stem}; "
-                               f"player {Path(self.player).name}")
+                               f"player {self._player_label()}")
             return True
         self.selected_path = ""
         self.selected_lang = ""
@@ -3947,27 +4076,91 @@ class PiperBackend(SpeechBackend):
             if stop_event.is_set() or not output.exists():
                 return
             player = self.player
-            if Path(player).name.startswith("ffplay"):
-                command = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", str(output)]
+            if player == "android":
+                self._play_android(output, stop_event)
             else:
-                command = [player, str(output)]
-            self._player_process = subprocess.Popen(
-                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            deadline = time.time() + max(15.0, len(text) / 8.0 + 5.0)
-            while self._player_process.poll() is None and time.time() < deadline:
-                if stop_event.is_set():
-                    with contextlib.suppress(Exception):
-                        self._player_process.terminate()
-                    break
-                time.sleep(0.1)
+                if Path(player).name.startswith("ffplay"):
+                    command = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", str(output)]
+                else:
+                    command = [player, str(output)]
+                self._player_process = subprocess.Popen(
+                    command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                deadline = time.time() + max(15.0, len(text) / 8.0 + 5.0)
+                while self._player_process.poll() is None and time.time() < deadline:
+                    if stop_event.is_set():
+                        with contextlib.suppress(Exception):
+                            self._player_process.terminate()
+                        break
+                    time.sleep(0.1)
         except Exception as exc:  # noqa: BLE001
             LOG.warning(f"piper failed: {exc}")
         finally:
             with contextlib.suppress(OSError):
                 output.unlink()
 
+    def _play_android(self, wav: Path, stop_event: Optional[threading.Event] = None) -> bool:
+        """Play a rendered WAV with android.media.MediaPlayer (blocking)."""
+        try:
+            from jnius import autoclass  # type: ignore
+
+            MediaPlayer = autoclass("android.media.MediaPlayer")
+            player = MediaPlayer()
+            player.setDataSource(str(wav))
+            player.prepare()
+            player.start()
+            self._android_player = player
+            # 22.05 kHz 16-bit mono ≈ 44 KB/s; the cap only guards a stuck player.
+            deadline = time.time() + max(20.0, wav.stat().st_size / 24000.0)
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    with contextlib.suppress(Exception):
+                        player.stop()
+                    break
+                try:
+                    if not player.isPlaying():
+                        break
+                except Exception:
+                    break
+                time.sleep(0.1)
+            with contextlib.suppress(Exception):
+                player.release()
+            self._android_player = None
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"piper playback failed: {exc}")
+            self._android_player = None
+            return False
+
+    def play_wav(self, wav: str) -> bool:
+        """Play a rendered file without blocking the UI thread."""
+        path = Path(wav)
+        if not _is_file(path):
+            return False
+        if self.player == "android":
+            def run() -> None:
+                self._play_android(path)
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+            threading.Thread(target=run, name="piper-play", daemon=True).start()
+            return True
+        try:
+            from kivy.core.audio import SoundLoader
+
+            sound = SoundLoader.load(str(path))
+            if sound is not None:
+                sound.play()
+                return True
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"voice test playback failed: {exc}")
+        return False
+
     def stop(self) -> None:
+        if self._android_player is not None:
+            with contextlib.suppress(Exception):
+                self._android_player.stop()
+            self._android_player = None
         for process in (self._process, self._player_process):
             if process is not None and process.poll() is None:
                 with contextlib.suppress(Exception):
@@ -4165,6 +4358,32 @@ class SpeechEngine:
             for piece in re.split(r"(?<=[.!?؟\n])\s+", text.strip()):
                 if piece.strip():
                     self._queue.put((piece.strip()[:1800], language, self.config.tts_rate))
+
+    def speak_now(self, text: str, lang: Optional[str] = None) -> bool:
+        """Speak one utterance even when ambient speech output is switched off.
+
+        Used by the voice-test buttons so a deliberate test always produces
+        sound. The backend is re-evaluated first because Android TTS may have
+        finished initialising after the engine was constructed.
+        """
+        text = (text or "").strip()
+        if not text:
+            return False
+        with self._lock:
+            self.backend = self._choose_backend()
+            language = lang or detect_language(text)
+            backend = self._backend_for(language)
+            if backend is None:
+                return False
+            ensure = getattr(backend, "ensure_ready", None)
+            if callable(ensure):
+                with contextlib.suppress(Exception):
+                    ensure(timeout=0.5)
+            if not backend.available:
+                return False
+            self._stop_event.clear()
+            self._queue.put((text[:1800], language, self.config.tts_rate))
+        return True
 
     def stop(self) -> None:
         with self._lock:
@@ -4451,35 +4670,50 @@ class VoiceEngine:
         self.on_final = on_final
         self.on_error = on_error
         self.models = discover_vosk_models()
-        self._vosk = None
+        self._vosk: Any = None
         self._vosk_error = ""
-        try:
-            import vosk  # type: ignore
-
-            self._vosk = vosk
-        except Exception as exc:  # noqa: BLE001
-            self._vosk = None
-            self._vosk_error = f"{type(exc).__name__}: {exc}"
-            LOG.warning(f"vosk import failed: {self._vosk_error}")
-            if IS_ANDROID:
-                # The pip package has no Android build; use vosk-android (AAR).
-                try:
-                    self._vosk = _AndroidVoskShim()
-                    self._vosk_error = ""
-                    LOG.info("Vosk: using vosk-android (org.vosk) backend")
-                except Exception as exc2:  # noqa: BLE001
-                    self._vosk = None
-                    self._vosk_error = (
-                        f"vosk-android AAR not packaged ({type(exc2).__name__}: {exc2}); "
-                        "add it to android.gradle_dependencies and rebuild"
-                    )
-                    LOG.warning(self._vosk_error)
+        self._initialise_backend()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._source: Optional[AudioSource] = None
         self.state = "idle"
         self.mode = "command"
         self._locked_lang = "en"
+
+    def _initialise_backend(self) -> None:
+        self._vosk = None
+        self._vosk_error = ""
+        try:
+            import vosk  # type: ignore
+
+            self._vosk = vosk
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._vosk_error = f"{type(exc).__name__}: {exc}"
+            LOG.warning(f"vosk import failed: {self._vosk_error}")
+        if not IS_ANDROID:
+            return
+        # The pip package has no Android build; use vosk-android (AAR).
+        try:
+            self._vosk = _AndroidVoskShim()
+            self._vosk_error = ""
+            LOG.info("Vosk: using vosk-android (org.vosk) backend")
+        except Exception as exc:  # noqa: BLE001
+            self._vosk = None
+            self._vosk_error = (
+                f"vosk-android AAR not packaged ({type(exc).__name__}: {exc}); "
+                "add it to android.gradle_dependencies and rebuild"
+            )
+            LOG.warning(self._vosk_error)
+
+    def refresh(self) -> bool:
+        """Re-scan models and retry the backend after a storage grant or late install."""
+        if self._thread and self._thread.is_alive():
+            return self.available
+        self.models = discover_vosk_models()
+        if self._vosk is None:
+            self._initialise_backend()
+        return self.available
 
     @property
     def available(self) -> bool:
@@ -4524,6 +4758,8 @@ class VoiceEngine:
         return None
 
     def start(self, mode: str = "command") -> bool:
+        if not self.available:
+            self.refresh()
         if not self.available:
             if self.on_error:
                 self.on_error(self.status)
@@ -12453,7 +12689,7 @@ class ChatScreen(ScreenBase):
             self.palette, hint_text=L("ask_placeholder"), size_hint=(1, 1),
         )
         self.input.bind(on_text_validate=lambda *_: self.app.ui_guard(self.send_current))
-        self.input.bind(focus=lambda _widget, focused: self.scroll_bottom() if focused else None)
+        self.input.bind(focus=self._on_input_focus)
         self.input.bind(text=self._on_composer_changed)
         input_row.add_widget(self.input)
         self.mic_btn = NeonButton(self.palette, text="Mic", size_hint=(None, 1), width=dp(42), font_size=sp(8.5))
@@ -12480,6 +12716,21 @@ class ChatScreen(ScreenBase):
         self.restore_draft()
 
     # -- drafts and composer ---------------------------------------------
+    def _on_input_focus(self, _widget: Any, focused: bool) -> None:
+        """Lift the composer as soon as the IME starts animating in.
+
+        The IME poll runs four times a second; these immediate passes close the
+        visible gap between the keyboard appearing and the layout moving, and
+        keep the caret row visible while the keyboard settles.
+        """
+        if not focused:
+            return
+        self.scroll_bottom()
+        update_layout = getattr(self.app, "update_layout", None)
+        if update_layout is not None:
+            for delay in (0.05, 0.2, 0.45, 0.7):
+                Clock.schedule_once(update_layout, delay)
+
     def _draft_key(self) -> str:
         return f"draft:{int(self.core.config.last_conversation_id or 0)}"
 
@@ -14213,7 +14464,19 @@ def download_model_asset(url: str, category: str,
                     "extracted": 0, "gguf": [], "voices": [],
                     "message": f"Already downloaded: {name}",
                 }
+            if response.status_code in (401, 403):
+                return {"ok": False, "error": (
+                    f"Server refused the download (HTTP {response.status_code}). "
+                    "Hugging Face gated models need a token; pick a public model or "
+                    "paste a direct /resolve/ link."
+                )}
             response.raise_for_status()
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if content_type.startswith("text/html"):
+                return {"ok": False, "error": (
+                    "The URL returned a web page, not a model file. Copy the direct "
+                    "download link (Hugging Face: use /resolve/ instead of /blob/)."
+                )}
             if resume_from and response.status_code != 206:
                 resume_from = 0
             remaining = int(response.headers.get("Content-Length") or 0)
@@ -14695,7 +14958,7 @@ class ModelsScreen(ScreenBase):
             return
         with contextlib.suppress(Exception):
             if category.startswith("vosk-"):
-                self.core.voice.models = discover_vosk_models()
+                self.core.voice.refresh()
             elif category == "piper-tts":
                 piper = self.core.tts.piperian
                 piper.binary = piper._find_binary()
@@ -14763,34 +15026,25 @@ class ModelsScreen(ScreenBase):
             if voice.get("lang") == "ar"
             else "Hello, this is a Boshra voice test."
         )
+        lang = str(voice.get("lang") or "en")
         piper = self.core.tts.piperian
 
         def work() -> Any:
-            # Android cannot execute the desktop Piper binary; go straight to
-            # the system voice instead of surfacing a "binary not found" error.
-            if piper.binary and not IS_ANDROID:
-                wav = piper.synthesize(sample, str(voice.get("path", "")), float(self.core.config.tts_rate))
+            # Only a real binary can render the ONNX voice. Android ships no
+            # Piper executable, so the system engine handles the test there.
+            if piper.binary:
+                wav = piper.synthesize(sample, str(voice.get("path", "")),
+                                       float(self.core.config.tts_rate))
                 if wav is not None:
                     return {"ok": True, "wav": str(wav)}
             return {"ok": False}
 
         def done(result: Any) -> None:
             result = result or {}
-            if result.get("ok"):
-                try:
-                    from kivy.core.audio import SoundLoader
-                    sound = SoundLoader.load(str(result.get("wav")))
-                    if sound is not None:
-                        sound.play()
-                        self.app.toast(T("Playing voice test", "جارٍ تشغيل اختبار الصوت"))
-                        return
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning(f"voice test playback failed: {exc}")
-                self.app.toast(T("Voice rendered, but playback is unavailable.",
-                                 "تم توليد الصوت، لكن التشغيل غير متاح."), 5)
+            if result.get("ok") and piper.play_wav(str(result.get("wav", ""))):
+                self.app.toast(T("Playing voice test", "جارٍ تشغيل اختبار الصوت"))
                 return
-            if self.core.tts.available:
-                self.core.tts.speak(sample, str(voice.get("lang") or "en"))
+            if self.core.tts.speak_now(sample, lang):
                 if IS_ANDROID:
                     message = T(
                         "Playing the test with the Android system voice.",
@@ -14798,16 +15052,16 @@ class ModelsScreen(ScreenBase):
                     )
                 else:
                     message = T(
-                        "Piper binary not found; testing with the system voice instead.",
-                        "لم يُعثر على ملف Piper التنفيذي؛ يتم الاختبار بصوت النظام بدلاً منه.",
+                        "Speaking the test with the system voice.",
+                        "يتم تشغيل الاختبار بصوت النظام.",
                     )
                 self.app.toast(message, 5)
             elif IS_ANDROID:
                 self.app.toast(T(
-                    "No speech engine: enable an Android text-to-speech engine, "
-                    "or choose a .onnx voice on desktop.",
-                    "لا يوجد محرك نطق: فعّل محرك النطق في إعدادات أندرويد، "
-                    "أو اختر صوت .onnx على الحاسب.",
+                    "No speech engine: install or enable an Android text-to-speech "
+                    "engine in system settings, then test again.",
+                    "لا يوجد محرك نطق: ثبّت أو فعّل محرك النطق في إعدادات أندرويد، "
+                    "ثم أعد الاختبار.",
                 ), 7)
             else:
                 self.app.toast(T(
@@ -15982,7 +16236,7 @@ class BoshraApp(App):
         self._tick_event = Clock.schedule_interval(self.tick, 0.5)
         self._insets_event = Clock.schedule_interval(self._refresh_insets_safe, 6.0)
         if IS_ANDROID:
-            self._ime_event = Clock.schedule_interval(self._poll_ime, 0.25)
+            self._ime_event = Clock.schedule_interval(self._poll_ime, 0.15)
         if self._post_rebuild_toast:
             message, self._post_rebuild_toast = self._post_rebuild_toast, ""
             Clock.schedule_once(lambda _dt: self.toast(message), 0.1)
@@ -16890,9 +17144,6 @@ class BoshraApp(App):
             self.run_bg(voice.stop, lambda _result: None)
             self.set_state("idle")
             self.toast(T("Listening stopped.", "تم إيقاف الاستماع."), 1.6)
-            return
-        if not voice.available:
-            self.toast(T("Voice unavailable: ", "الصوت غير متاح: ") + voice.status, 6)
             return
 
         def work() -> Dict[str, Any]:
