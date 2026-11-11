@@ -18,9 +18,18 @@ source.include_exts = py,python3,kivy,vosk,pyc,png,jpg,kv,atlas,onnx,json,bin,pa
 
 #source.include_exts = py,pyc,png,jpg,kv,atlas,json,mp3,wav,ttf,ttc,db,txt,pdf,docx
 
+# Model folders are read from /sdcard/assets at runtime; bundling them would
+# add >1 GB to the APK (and Buildozer cannot ship multi-GB assets reliably).
+source.exclude_dirs = assets/phi3, assets/piper-tts, assets/vosk-model-ar, assets/vosk-model-en, assets/temp_downloads
+source.exclude_patterns = assets/*.zip
+
+
+
 
 # vosk-android + JNA provide org.vosk.* (do NOT add the pip "vosk" package)
 android.gradle_dependencies = com.alphacephei:vosk-android:0.3.47, net.java.dev.jna:jna:5.13.0@aar
+
+
 
 # (list) Patterns to include (assets folder)
 source.include_patterns = assets/*
@@ -42,8 +51,8 @@ fullscreen = 1
 
 # (list) Python/p4a requirements
 # llama-cpp-python needs a working recipe at ./recipes/llama-cpp-python/__init__.py
-
-requirements = python3,kivy==2.3.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3==1.26.18,idna,certifi,charset-normalizer==2.1.1,pypdf,pillow,arabic_reshaper,python-bidi==0.4.2
+# requirements = python3,kivy==2.3.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3==1.26.18,idna,certifi,charset-normalizer==2.1.1,pypdf,pillow,arabic_reshaper,python-bidi==0.4.2
+requirements = python3,kivy==2.3.0,pyjnius,android,plyer,openssl,sqlite3,requests,urllib3==1.26.18,idna,certifi,charset-normalizer==2.1.1,pypdf,pillow,arabic_reshaper,python-bidi==0.4.2,cffi,vosk==0.3.45,numpy,llama-cpp-python==0.3.16
 
 
 # Local recipes folder (cross-compiles the inference engine for Android)
@@ -71,6 +80,8 @@ android.enable_androidx = True
 
 # (list) Android permissions
 android.permissions = INTERNET, RECORD_AUDIO, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE, FOREGROUND_SERVICE, FOREGROUND_SERVICE_SPECIAL_USE, SYSTEM_ALERT_WINDOW, VIBRATE, ACCESS_NETWORK_STATE, WAKE_LOCK, POST_NOTIFICATIONS
+
+
 
 # Extra manifest XML (accessibility <service> entry goes here). File must exist.
 # android.extra_manifest_xml = android_extras.xml
