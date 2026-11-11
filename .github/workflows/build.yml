@@ -44,10 +44,18 @@ jobs:
         run: |
           rm -rf .buildozer bin
 
-      - name: Build with Buildozer
+      - name: Run Buildozer
+        env:
+          GGML_NATIVE: "OFF"
+          CMAKE_ARGS: "-DGGML_NATIVE=OFF"
         run: |
-          set -o pipefail
-          buildozer -v android debug 2>&1 | tee build.log
+          buildozer -v android debug
+      
+      
+      
+      
+      
+      
 
       - name: Show error context
         if: failure()
