@@ -30,6 +30,11 @@ jobs:
             libtool-bin pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
             libtinfo6 cmake libffi-dev libltdl-dev libssl-dev gettext
 
+      - name: Install compatible CMake version
+        run: | 
+          pip install --upgrade cmake==3.28.3
+
+    
       - name: Install Buildozer and Cython
         run: |
           pip install --upgrade pip
