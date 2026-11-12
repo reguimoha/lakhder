@@ -33,6 +33,7 @@ Android package:  buildozer android debug   (see README.md)
 
 from __future__ import annotations
 
+import array
 import contextlib
 import csv
 import gc
@@ -102,7 +103,7 @@ def _resolve_private_dir() -> Path:
         base = (
             os.environ.get("ANDROID_PRIVATE")
             or os.environ.get("ANDROID_APP_PATH")
-            or "/data/data/org.bochra.bochra/files"
+            or "/data/data/org.boshra.boshra/files"
         )
         return Path(base)
     override = os.environ.get("BOSHRA_HOME")
@@ -1253,6 +1254,7 @@ class Config:
     online_mode: str = "auto"        # local|online|auto
     wake_word: str = "hello boshra"
     continuous_conversation: bool = False
+    wake_enabled: bool = False       # background wake-word monitor kill switch
     tts_enabled: bool = True
     tts_rate: float = 1.0
     tts_voice: str = "auto"
@@ -2446,6 +2448,8 @@ class AndroidBridge:
         self.reason = "desktop mode"
         self.activity = None
         self.context = None
+        self._tones: List[Any] = []
+        self._tone_lock = threading.Lock()
         if not IS_ANDROID:
             return
         try:
@@ -2461,7 +2465,55 @@ class AndroidBridge:
             self.reason = f"Pyjnius bridge unavailable: {exc}"
             LOG.error("android bridge init failed", exc)
 
-    # -- sensors / device ------------------------------------------------
+    # -- audio output ----------------------------------------------------
+    def media_volume(self) -> Optional[Tuple[int, int]]:
+        """Return (current, max) on the music stream, or None off Android."""
+        if not self.available:
+            return None
+        try:
+            Context = self.autoclass("android.content.Context")
+            AudioManager = self.autoclass("android.media.AudioManager")
+            manager = self.context.getSystemService(Context.AUDIO_SERVICE)
+            if not manager:
+                return None
+            return (
+                int(manager.getStreamVolume(AudioManager.STREAM_MUSIC)),
+                int(manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug(f"media volume unavailable: {exc}")
+            return None
+
+    def play_tone(self, path: str, volume: float = 0.5) -> bool:
+        """Play a WAV through MediaPlayer: the reliable sink on Android."""
+        if not self.available:
+            return False
+        try:
+            MediaPlayer = self.autoclass("android.media.MediaPlayer")
+            player = MediaPlayer()
+            player.setDataSource(str(path))
+            player.prepare()
+            level = float(clamp(volume, 0.0, 1.0))
+            player.setVolume(level, level)
+            player.start()
+            with self._tone_lock:
+                self._tones.append(player)
+            duration = max(0.6, float(player.getDuration()) / 1000.0 + 0.4)
+            threading.Timer(duration, self._release_tone, args=(player,)).start()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"MediaPlayer tone failed: {exc}")
+            return False
+
+    def _release_tone(self, player: Any) -> None:
+        with self._tone_lock:
+            with contextlib.suppress(ValueError):
+                self._tones.remove(player)
+        with contextlib.suppress(Exception):
+            player.stop()
+        with contextlib.suppress(Exception):
+            player.release()
+
     def play_click(self, volume: float = 0.4) -> bool:
         """System key-click used only when Kivy audio cannot play our tone."""
         if not self.available:
@@ -2995,35 +3047,107 @@ class AndroidBridge:
     def float_status(self) -> Dict[str, Any]:
         if not self.available:
             return {"supported": False, "granted": False, "running": False,
-                    "suppressed": False, "reason": "desktop mode"}
+                    "suppressed": False, "listening": False, "user_hidden": False,
+                    "reason": "desktop mode"}
         try:
-            service = self.autoclass("org.bochra.bochra.BoshraFloatService")
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
         except Exception:
             return {"supported": False, "granted": self.overlay_granted(),
-                    "running": False, "suppressed": False,
-                    "reason": "float service not packaged"}
-        running = False
-        suppressed = False
+                    "running": False, "suppressed": False, "listening": False,
+                    "user_hidden": False, "reason": "float service not packaged"}
+        running = suppressed = listening = hidden = False
         with contextlib.suppress(Exception):
             running = bool(service.isRunning())
         with contextlib.suppress(Exception):
             suppressed = bool(service.isSuppressed())
+        with contextlib.suppress(Exception):
+            listening = bool(service.isListening(self.context))
+        with contextlib.suppress(Exception):
+            hidden = bool(service.wasUserHidden(self.context))
         return {"supported": True, "granted": self.overlay_granted(),
-                "running": running, "suppressed": suppressed, "reason": ""}
+                "running": running, "suppressed": suppressed,
+                "listening": listening, "user_hidden": hidden, "reason": ""}
 
-    def float_clear_suppressed(self) -> None:
+    def float_set_app_foreground(self, foreground: bool) -> None:
+        """The sphere steps aside for the full app and returns when we background."""
         if not self.available:
             return
         with contextlib.suppress(Exception):
-            service = self.autoclass("org.bochra.bochra.BoshraFloatService")
-            service.clearSuppressed()
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
+            service.setAppForeground(self.context, bool(foreground))
+
+    def float_listening(self) -> bool:
+        if not self.available:
+            return False
+        try:
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
+            return bool(service.isListening(self.context))
+        except Exception:
+            return False
+
+    def float_set_listening(self, on: bool) -> bool:
+        if not self.available:
+            return False
+        try:
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
+            service.setListening(self.context, bool(on))
+            return bool(on)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"float listening toggle failed: {exc}")
+            return False
+
+    def float_user_hidden(self) -> bool:
+        if not self.available:
+            return False
+        try:
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
+            return bool(service.wasUserHidden(self.context))
+        except Exception:
+            return False
+
+    def float_clear_user_hidden(self) -> None:
+        if not self.available:
+            return
+        with contextlib.suppress(Exception):
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
+            service.clearUserHidden(self.context)
+
+    def launch_app(self, action: str = "") -> bool:
+        """Bring the Kivy activity to the front, optionally carrying a menu action."""
+        if not self.available:
+            return False
+        try:
+            Intent = self.autoclass("android.content.Intent")
+            intent = Intent()
+            intent.setClassName(self.context.getPackageName(),
+                                "org.kivy.android.PythonActivity")
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                            | Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            if action:
+                intent.putExtra("boshra_action", str(action))
+            self.context.startActivity(intent)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"launch app failed: {exc}")
+            return False
+
+    def move_task_to_back(self) -> bool:
+        """Sink the activity so only the sphere stays on screen."""
+        if not self.available or self.activity is None:
+            return False
+        try:
+            return bool(self.activity.moveTaskToBack(True))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(f"move task to back failed: {exc}")
+            return False
 
     def float_position(self) -> Optional[Tuple[float, float]]:
         """Bubble centre saved by the overlay as display fractions, if any."""
         if not self.available:
             return None
         try:
-            service = self.autoclass("org.bochra.bochra.BoshraFloatService")
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
             fx = float(service.savedFractionX(self.context))
             fy = float(service.savedFractionY(self.context))
         except Exception as exc:  # noqa: BLE001
@@ -3035,18 +3159,18 @@ class AndroidBridge:
 
     def float_start(self, size_dp: int = 58, color: str = "cyan",
                     style: str = "liquid",
-                    fraction: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
+                    fraction: Optional[Tuple[float, float]] = None,
+                    require_overlay: bool = True) -> Dict[str, Any]:
         if not self.available:
             return {"ok": False, "error": "The floating orb requires Android"}
-        if not self.overlay_granted():
+        if require_overlay and not self.overlay_granted():
             return {"ok": False, "error": "overlay permission required",
                     "needs_permission": True}
-        self.float_clear_suppressed()
         try:
             Intent = self.autoclass("android.content.Intent")
-            service_class = self.autoclass("org.bochra.bochra.BoshraFloatService")
+            service_class = self.autoclass("org.boshra.boshra.BoshraFloatService")
             intent = Intent(self.context, service_class)
-            intent.setAction("org.bochra.bochra.SHOW")
+            intent.setAction("org.boshra.boshra.SHOW")
             intent.putExtra("bubble_size", int(size_dp))
             primary, glow = sphere_colors(color)
             intent.putExtra("sphere_primary", int(sphere_rgb_int(primary)))
@@ -3073,12 +3197,12 @@ class AndroidBridge:
         if not self.available:
             return
         try:
-            service_class = self.autoclass("org.bochra.bochra.BoshraFloatService")
+            service_class = self.autoclass("org.boshra.boshra.BoshraFloatService")
             if not bool(service_class.isRunning()):
                 return
             Intent = self.autoclass("android.content.Intent")
             intent = Intent(self.context, service_class)
-            intent.setAction("org.bochra.bochra.SHOW")
+            intent.setAction("org.boshra.boshra.SHOW")
             intent.putExtra("bubble_size", int(size_dp))
             primary, glow = sphere_colors(color)
             intent.putExtra("sphere_primary", int(sphere_rgb_int(primary)))
@@ -3096,17 +3220,26 @@ class AndroidBridge:
         if not self.available:
             return {"ok": False, "error": "The floating orb requires Android"}
         try:
-            service = self.autoclass("org.bochra.bochra.BoshraFloatService")
+            service = self.autoclass("org.boshra.boshra.BoshraFloatService")
             if not bool(service.isRunning()):
                 return {"ok": True, "message": "Floating assistant already hidden"}
             Intent = self.autoclass("android.content.Intent")
             intent = Intent(self.context, service)
-            intent.setAction("org.bochra.bochra.HIDE")
+            intent.setAction("org.boshra.boshra.HIDE")
             self.context.startService(intent)
             return {"ok": True, "message": "Floating assistant hidden"}
         except Exception as exc:  # noqa: BLE001
             LOG.error("float stop failed", exc)
             return {"ok": False, "error": f"Could not stop the float service: {exc}"}
+
+    def float_service_stop(self) -> None:
+        """Stop the foreground service without marking the sphere as user-hidden."""
+        if not self.available:
+            return
+        with contextlib.suppress(Exception):
+            Intent = self.autoclass("android.content.Intent")
+            service_class = self.autoclass("org.boshra.boshra.BoshraFloatService")
+            self.context.stopService(Intent(self.context, service_class))
 
     def launch_action(self) -> str:
         """Action carried by the intent that launched the running activity."""
@@ -4621,8 +4754,10 @@ class _AndroidVoskShim:
     def Model(self, path: str) -> Any:  # noqa: N802
         return self._ModelCls(str(path))
 
-    def KaldiRecognizer(self, model: Any, rate: float) -> Any:  # noqa: N802
-        return _AndroidKaldiRecognizer(self._RecognizerCls(model, float(rate)))
+    def KaldiRecognizer(self, model: Any, rate: float, grammar: Optional[str] = None) -> Any:  # noqa: N802
+        if grammar is None:
+            return _AndroidKaldiRecognizer(self._RecognizerCls(model, float(rate)))
+        return _AndroidKaldiRecognizer(self._RecognizerCls(model, float(rate), str(grammar)))
 
 
 class _AndroidKaldiRecognizer:
@@ -4879,6 +5014,282 @@ class VoiceEngine:
 
 
 # --------------------------------------------------------------------------
+# Background wake word (same process, one model, kill switch)
+# --------------------------------------------------------------------------
+WAKE_GRAMMARS = {
+    "ar": ["بشرى", "يا بشرى", "هلا بشرى", "مرحبا بشرى", "أهلا بشرى", "[unk]"],
+    "en": ["boshra", "hey boshra", "hello boshra", "hi boshra", "ok boshra", "[unk]"],
+}
+
+
+class WakeWordMonitor:
+    """Wake-word listener that runs while Boshra is in the background.
+
+    Design constraints for 4-6 GB phones:
+      * one Vosk model and one keyword grammar, loaded on the worker thread and
+        released as soon as the monitor stops;
+      * the microphone is only opened while the kill switch and the
+        notification's listening flag are both on, otherwise the thread sleeps;
+      * frames are classified in RAM and dropped: nothing is written to disk
+        and no network API is reachable from this class;
+      * the PCM energy gate is hand-rolled because Python 3.14 removed
+        ``audioop``, so quiet frames never reach the recogniser.
+    """
+
+    IDLE_SECONDS = 0.8
+    CHECK_SECONDS = 1.0
+    ENERGY_FLOOR = 320          # mean |sample| of 32767, roughly -40 dBFS
+    TAIL_FRAMES = 6             # keep decoding briefly after speech stops
+    _BIG_ENDIAN = sys.byteorder == "big"
+
+    def __init__(
+        self,
+        bridge: AndroidBridge,
+        config: ConfigManager,
+        store: Store,
+        on_wake: Optional[Callable[[], None]] = None,
+        on_state: Optional[Callable[[str], None]] = None,
+        is_busy: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        self.bridge = bridge
+        self.config = config
+        self.store = store
+        self.on_wake = on_wake
+        self.on_state = on_state
+        self.is_busy = is_busy
+        self.state = "off"
+        self.last_error = ""
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._source: Optional[AudioSource] = None
+        self._model: Any = None
+        self._lang = ""
+        self._shim: Any = None
+        self._allowed = False
+        self._checked_at = 0.0
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
+
+    def _set_state(self, state: str) -> None:
+        if state == self.state:
+            return
+        self.state = state
+        if self.on_state is not None:
+            with contextlib.suppress(Exception):
+                self.on_state(state)
+
+    def refresh(self) -> bool:
+        """Apply a config change by rebuilding the worker."""
+        self.stop()
+        return self.start()
+
+    def start(self) -> bool:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            # A slow model load may still be unwinding; reuse that worker.
+            self._stop.clear()
+            return True
+        self._stop.clear()
+        self._checked_at = 0.0
+        self._thread = threading.Thread(target=self._loop, name="boshra-wake", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        source, self._source = self._source, None
+        if source is not None:
+            with contextlib.suppress(Exception):
+                source.stop()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=2.0)
+        if thread is None or not thread.is_alive():
+            self._thread = None
+        self._release_model()
+        self._allowed = False
+        self._set_state("off")
+
+    def _release_model(self) -> None:
+        self._model = None
+        gc.collect()
+
+    # ------------------------------------------------------------- gate
+
+    def _should_listen(self) -> bool:
+        """Kill switch + notification flag + no foreground recogniser running."""
+        now = time.time()
+        if now - self._checked_at < self.CHECK_SECONDS:
+            return self._allowed
+        self._checked_at = now
+        allowed = bool(self.config.wake_enabled)
+        if allowed and IS_ANDROID:
+            allowed = self.bridge.float_listening()
+        if allowed and self.is_busy is not None:
+            with contextlib.suppress(Exception):
+                allowed = not bool(self.is_busy())
+        self._allowed = allowed
+        return allowed
+
+    # ------------------------------------------------------------ model
+
+    def _vosk_backend(self) -> Any:
+        try:
+            import vosk  # type: ignore
+
+            return vosk
+        except Exception:  # noqa: BLE001
+            if not IS_ANDROID:
+                return None
+        if self._shim is None:
+            try:
+                self._shim = _AndroidVoskShim()
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"vosk-android unavailable: {exc}"
+                return None
+        return self._shim
+
+    def _load_recognizer(self) -> Optional[Any]:
+        vosk = self._vosk_backend()
+        if vosk is None:
+            self.last_error = self.last_error or "vosk module missing"
+            return None
+        models = discover_vosk_models()
+        if not models:
+            self.last_error = "no Vosk model found (check /sdcard/assets)"
+            return None
+        preferred = self.config.language if self.config.language in models else ""
+        self._lang = preferred or ("ar" if "ar" in models else next(iter(models)))
+        grammar = json.dumps(WAKE_GRAMMARS.get(self._lang, WAKE_GRAMMARS["en"]),
+                             ensure_ascii=False)
+        try:
+            model = vosk.Model(models[self._lang])
+            self._model = model
+            return vosk.KaldiRecognizer(model, 16000, grammar)
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"Vosk model load failed: {exc}"
+            self._release_model()
+            return None
+
+    # ------------------------------------------------------------ audio
+
+    @classmethod
+    def _level(cls, data: bytes) -> int:
+        """Mean absolute amplitude of 16-bit mono PCM, without audioop."""
+        samples = array.array("h")
+        samples.frombytes(data[: len(data) - (len(data) % 2)])
+        if cls._BIG_ENDIAN:
+            samples.byteswap()
+        if not samples:
+            return 0
+        step = 2 if len(samples) > 2048 else 1
+        chunk = samples[::step]
+        return sum(abs(value) for value in chunk) // max(1, len(chunk))
+
+    def _heard_wake(self, text: str) -> bool:
+        cleaned = re.sub(r"[^\w\u0600-\u06FF ]+", " ",
+                         normalize_arabic(text or "").lower()).strip()
+        if not cleaned:
+            return False
+        variants = list(WAKE_GRAMMARS["ar"][:-1]) + list(WAKE_GRAMMARS["en"][:-1])
+        variants.append(self.config.wake_word)
+        for variant in variants:
+            needle = re.sub(r"[^\w\u0600-\u06FF ]+", " ",
+                            normalize_arabic(variant or "").lower()).strip()
+            if needle and needle in cleaned:
+                return True
+        return False
+
+    # ------------------------------------------------------------- loop
+
+    def _loop(self) -> None:
+        recognizer = None
+        source: Optional[AudioSource] = None
+        tail = 0
+        try:
+            while not self._stop.is_set():
+                if not self._should_listen():
+                    if source is not None:
+                        with contextlib.suppress(Exception):
+                            source.stop()
+                        source = None
+                        self._source = None
+                    if recognizer is not None:
+                        # Release the STT model while the app is in front so the
+                        # LLM has the memory budget to itself (4-6 GB devices).
+                        recognizer = None
+                        self._release_model()
+                    self._set_state("standby" if bool(self.config.wake_enabled) else "off")
+                    self._stop.wait(self.IDLE_SECONDS)
+                    continue
+                if recognizer is None:
+                    recognizer = self._load_recognizer()
+                    if recognizer is None:
+                        self._set_state("error")
+                        self._stop.wait(self.CHECK_SECONDS)
+                        continue
+                if source is None:
+                    if IS_ANDROID and not self.bridge.ensure_permission("RECORD_AUDIO", timeout=6):
+                        self.last_error = "microphone permission required"
+                        self._set_state("error")
+                        self._stop.wait(self.CHECK_SECONDS)
+                        continue
+                    source = AndroidAudioSource(self.bridge) if IS_ANDROID else DesktopAudioSource()
+                    source.start()
+                    if not source.available:
+                        self.last_error = source.status
+                        source = None
+                        self._set_state("error")
+                        self._stop.wait(self.CHECK_SECONDS)
+                        continue
+                    self._source = source
+                    self.last_error = ""
+                    self._set_state("listening")
+                    self.store.audit("voice", "wake-listen", f"lang={self._lang} local", "low")
+
+                data = source.read(3200)
+                if not data:
+                    tail = max(0, tail - 1)
+                    continue
+                level = self._level(data)
+                if level < self.ENERGY_FLOOR and tail == 0:
+                    continue
+                tail = self.TAIL_FRAMES if level >= self.ENERGY_FLOOR else max(0, tail - 1)
+                try:
+                    if recognizer.AcceptWaveform(data):
+                        payload = json.loads(recognizer.Result() or "{}")
+                        text = str(payload.get("text", ""))
+                    else:
+                        payload = json.loads(recognizer.PartialResult() or "{}")
+                        text = str(payload.get("partial", ""))
+                except Exception as exc:  # noqa: BLE001
+                    self.last_error = f"recognizer error: {exc}"
+                    continue
+                if text and self._heard_wake(text):
+                    self._fire()
+                    tail = 0
+        finally:
+            if source is not None:
+                with contextlib.suppress(Exception):
+                    source.stop()
+            self._source = None
+            self._release_model()
+            self.store.audit("voice", "wake-stop", f"lang={self._lang}", "low")
+            self._set_state("off")
+
+    def _fire(self) -> None:
+        self.store.audit("voice", "wake-hit", f"lang={self._lang} local", "low")
+        with contextlib.suppress(Exception):
+            self.bridge.vibrate(45)
+        self._set_state("wake")
+        if self.on_wake is not None:
+            with contextlib.suppress(Exception):
+                self.on_wake()
+
+
+# --------------------------------------------------------------------------
 # Permissions and risk gate
 # --------------------------------------------------------------------------
 PERMISSION_CATALOG: Dict[str, Tuple[str, str, str]] = {
@@ -5039,6 +5450,7 @@ class AppContext:
         self.llm: LLMService = None  # type: ignore[assignment]
         self.tts: SpeechEngine = None  # type: ignore[assignment]
         self.voice: Optional[VoiceEngine] = None
+        self.wake: Any = None
         self.permissions: PermissionManager = None  # type: ignore[assignment]
         self.skills: Any = None
         self.automation: Any = None
@@ -6301,12 +6713,23 @@ def tool_float(ctx: AppContext, args: Dict[str, Any]) -> ToolResult:
         if not outcome.get("ok"):
             return ToolResult(False, error=outcome.get("error") or "Could not start the float")
         ctx.config.set("float_enabled", True)
+        wake = getattr(ctx, "wake", None)
+        if wake is not None:
+            with contextlib.suppress(Exception):
+                wake.start()
         return ToolResult(True, T("Floating assistant is on. It stays above other apps.",
                                   "المساعد العائم يعمل الآن فوق التطبيقات الأخرى."),
                           data=outcome)
     if action == "stop":
         outcome = bridge.float_stop()
         ctx.config.set("float_enabled", False)
+        if ctx.config.wake_enabled:
+            ctx.config.set("wake_enabled", False)
+            bridge.float_set_listening(False)
+        wake = getattr(ctx, "wake", None)
+        if wake is not None:
+            with contextlib.suppress(Exception):
+                wake.stop()
         if not outcome.get("ok"):
             return ToolResult(False, error=outcome.get("error") or "Could not stop the float")
         return ToolResult(True, T("Floating assistant hidden.", "أُخفي المساعد العائم."),
@@ -6319,8 +6742,8 @@ def tool_float(ctx: AppContext, args: Dict[str, Any]) -> ToolResult:
                           error=None if ok else "Overlay settings are unavailable")
     status = bridge.float_status()
     status["enabled"] = bool(ctx.config.float_enabled)
-    if status.get("running") and status.get("suppressed"):
-        status["running"] = False
+    status["wake_enabled"] = bool(ctx.config.wake_enabled)
+    status["app_foreground"] = bool(status.get("suppressed"))
     label = T("running", "يعمل") if status["running"] else T("stopped", "متوقف")
     lines = [
         T(f"Floating assistant · {label}", f"المساعد العائم · {label}"),
@@ -11474,6 +11897,19 @@ class UISound:
                 self._kivy_failed = True
                 self.last_error = str(exc)
                 LOG.warning(f"UI sound playback failed: {exc}")
+        return self._media_tone(kind, volume)
+
+    def _media_tone(self, kind: str, volume: float) -> bool:
+        """Android fallback: MediaPlayer owns the audio focus and ignores SDL state."""
+        path = self._ensure_file(kind)
+        bridge = self.bridge
+        if path is not None and bridge is not None:
+            try:
+                if bridge.play_tone(str(path), max(0.05, volume)):
+                    self.plays += 1
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"media tone failed: {exc}"
         return self._system_click(volume)
 
     def _system_click(self, volume: float) -> bool:
@@ -11487,7 +11923,34 @@ class UISound:
             return False
 
     def test(self) -> bool:
-        return self.play("test")
+        """A deliberate test ignores the enable/volume switches and Kivy's cache."""
+        self.last_error = ""
+        path = self._ensure_file("test")
+        if path is None:
+            return False
+        level = max(0.25, self.volume if self.volume > 0.001 else 0.6)
+        bridge = self.bridge
+        if bridge is not None and getattr(bridge, "available", False):
+            try:
+                if bridge.play_tone(str(path), level):
+                    self.plays += 1
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"MediaPlayer failed: {exc}"
+        try:
+            from kivy.core.audio import SoundLoader
+
+            sound = SoundLoader.load(str(path))
+            if sound is not None:
+                sound.volume = level
+                sound.play()
+                self.plays += 1
+                self.last_error = ""
+                return True
+            self.last_error = "no Kivy audio provider accepted the WAV"
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"Kivy audio failed: {exc}"
+        return self._system_click(level)
 
     def warm_up(self) -> bool:
         with self._lock:
@@ -15246,13 +15709,27 @@ class SettingsScreen(ScreenBase):
         wrap.add_widget(wake)
         wrap.add_widget(save_wake)
         self._row(wrap, 38, T("Wake word", "كلمة التنبيه"))
+        self._switch_row(
+            T("Background wake word", "كلمة التنبيه في الخلفية"),
+            cfg.wake_enabled, self.set_wake_enabled,
+        )
+        self.box.add_widget(WrapLabel(text=shape_text(T(
+            "One local Vosk model listens only while Boshra is in the background. "
+            "Audio is classified in RAM and discarded; nothing is recorded or uploaded. "
+            "Turn this off, or tap “Stop listening” in the notification, to close the microphone.",
+            "يستمع نموذج Vosk محلي واحد فقط أثناء وجود بشرى في الخلفية. "
+            "يُصنَّف الصوت في الذاكرة ويُهمَل، ولا يُسجَّل أو يُرفع. أوقف هذا الخيار "
+            "أو اضغط «إيقاف الاستماع» في الإشعار لإغلاق الميكروفون.",
+        )), font_size=sp(7.6), color=_rgba(self.palette["dim"])))
         self._switch_row(T("Continuous conversation", "محادثة مستمرة"), cfg.continuous_conversation, self.set_continuous)
         self.voice_status = WrapLabel(
             text=shape_text("Voice: " + (self.core.voice.status if self.core.voice else "unavailable")
-                            + "\nTTS: " + self.core.tts.status),
+                            + "\nTTS: " + self.core.tts.status
+                            + "\nWake: " + self.core.wake.state
+                            + (f" ({self.core.wake.last_error})" if self.core.wake.last_error else "")),
             font_size=sp(8), color=_rgba(self.palette["dim"]),
         )
-        self._row(self.voice_status, 58, T("Status", "الحالة"))
+        self._row(self.voice_status, 68, T("Status", "الحالة"))
 
         self._section(T("Privacy & security", "الخصوصية والأمان"))
         self._switch_row(T("Confirm high-risk actions", "تأكيد الإجراءات الخطرة"), cfg.confirm_high_risk, self.set_confirm)
@@ -15376,11 +15853,23 @@ class SettingsScreen(ScreenBase):
     def test_sound(self) -> None:
         if self.core.ui_sound.test():
             self.app.toast(T("Test tone sent to the audio output.", "أُرسلت نغمة الاختبار إلى مخرج الصوت."))
-        else:
+            return
+        media = self.core.bridge.media_volume()
+        if media is not None and media[0] <= 0:
             self.app.toast(T(
-                "No audio output is available. Check media volume and re-enable button sounds.",
-                "لا يوجد مخرج صوت متاح. تحقق من مستوى الصوت وأعد تفعيل أصوات الأزرار.",
+                "Media volume is at 0 on this device. Raise the volume, then test again.",
+                "مستوى صوت الوسائط صفر على هذا الجهاز. ارفع الصوت ثم أعد الاختبار.",
             ), 5)
+            return
+        detail = (self.core.ui_sound.last_error or "").strip()
+        if detail:
+            self.app.toast(T(f"Audio output failed: {detail[:140]}",
+                             f"تعذّر إخراج الصوت: {detail[:140]}"), 6)
+            return
+        self.app.toast(T(
+            "No audio output is available. Check media volume and re-enable button sounds.",
+            "لا يوجد مخرج صوت متاح. تحقق من مستوى الصوت وأعد تفعيل أصوات الأزرار.",
+        ), 5)
 
     def set_intensity(self, value: float) -> None:
         self.core.config.set("shader_intensity", value)
@@ -15458,6 +15947,8 @@ class SettingsScreen(ScreenBase):
                 status.text = shape_text(
                     "Voice: " + (self.core.voice.status if self.core.voice else "unavailable")
                     + "\nTTS: " + self.core.tts.status
+                    + "\nWake: " + self.core.wake.state
+                    + (f" ({self.core.wake.last_error})" if self.core.wake.last_error else "")
                 )
         try:
             rows = build_asset_status(self.core)
@@ -15512,6 +16003,49 @@ class SettingsScreen(ScreenBase):
 
     def set_continuous(self, value: bool) -> None:
         self.core.config.set("continuous_conversation", value)
+
+    def set_wake_enabled(self, value: bool) -> None:
+        enabled = bool(value)
+        core = self.core
+        bridge = core.bridge
+        if enabled and not IS_ANDROID:
+            core.config.set("wake_enabled", False)
+            self.app.toast(T(
+                "The background wake word runs as an Android foreground service.",
+                "تعمل كلمة التنبيه الخلفية كخدمة أمامية على أندرويد فقط.",
+            ), 5)
+            return
+        if enabled:
+            if not bridge.ensure_permission("RECORD_AUDIO", timeout=30):
+                core.config.set("wake_enabled", False)
+                self.app.toast(T(
+                    "Microphone permission is required for the wake word.",
+                    "إذن الميكروفون مطلوب لكلمة التنبيه.",
+                ), 5)
+                return
+            core.config.set("wake_enabled", True)
+            bridge.ensure_permission("POST_NOTIFICATIONS", timeout=8)
+            bridge.float_set_listening(True)
+            if not bridge.float_status().get("running"):
+                bridge.float_start(
+                    58, core.config.sphere_color, core.config.sphere_style,
+                    self.app._orb_display_fraction(), require_overlay=False,
+                )
+            core.wake.start()
+            self.app.toast(T(
+                "Watching for the wake word in the background. Audio stays in RAM on this device.",
+                "أراقب كلمة التنبيه في الخلفية. يبقى الصوت في ذاكرة هذا الجهاز.",
+            ), 5)
+            return
+        core.config.set("wake_enabled", False)
+        core.wake.stop()
+        bridge.float_set_listening(False)
+        if bridge.float_status().get("running") and not core.config.float_enabled:
+            bridge.float_service_stop()
+        self.app.toast(T(
+            "Background listening is off. The microphone is closed and nothing was recorded.",
+            "الاستماع الخلفي متوقف. أُغلق الميكروفون ولم يُسجَّل شيء.",
+        ), 5)
 
     def set_confirm(self, value: bool) -> None:
         self.core.config.set("confirm_high_risk", value)
@@ -15571,9 +16105,8 @@ class SettingsScreen(ScreenBase):
         enabled = bool(value)
         self.core.config.set("float_enabled", enabled)
         self.app._mini_visible = enabled
-        if enabled:
-            self.core.bridge.float_clear_suppressed()
         if IS_ANDROID and enabled:
+            self.core.bridge.ensure_permission("POST_NOTIFICATIONS", timeout=8)
             status = self.core.bridge.float_status()
             if not status.get("granted") and not status.get("running"):
                 self.core.bridge.request_overlay_permission()
@@ -15591,6 +16124,8 @@ class SettingsScreen(ScreenBase):
                              "تعذّر تشغيل العائم. يظهر الزر داخل التطبيق بدلاً منه."), 5)
         elif enabled:
             self.app.toast(T("Floating assistant is on.", "المساعد العائم يعمل."), 3)
+        if enabled and IS_ANDROID and self.app._float_running:
+            self.app._sink_to_float()
 
     def set_auto_backup(self, value: str) -> None:
         with contextlib.suppress(ValueError):
@@ -15707,6 +16242,8 @@ class BoshraCore:
         self._shutting_down = False
         self.app: Optional[Any] = None
         self.busy = False
+        self.tts_state = "idle"
+        self.app_paused = False
         self._cpu_prev: Optional[Tuple[float, float]] = None
         self._cpu_value = 0.0
         self._cpu_at = 0.0
@@ -15784,6 +16321,14 @@ class BoshraCore:
         )
         ctx.voice = self.voice
 
+        self.wake = WakeWordMonitor(
+            self.bridge, self.config, self.store,
+            on_wake=self._on_wake_word,
+            on_state=self._on_wake_state,
+            is_busy=self._wake_busy,
+        )
+        ctx.wake = self.wake
+
         self.orchestrator = IntelligenceOrchestrator(ctx)
         ctx.orchestrator = self.orchestrator
         ctx.confirm_handler = self._confirm
@@ -15796,6 +16341,7 @@ class BoshraCore:
 
     # -- notification bridges -------------------------------------------
     def _on_tts_state(self, state: str) -> None:
+        self.tts_state = state
         self.ctx.emit("tts", state=state)
 
     def _on_voice_state(self, state: str) -> None:
@@ -15809,6 +16355,23 @@ class BoshraCore:
 
     def _on_voice_error(self, text: str) -> None:
         self.ctx.emit("voice_error", text=text)
+
+    def _on_wake_state(self, state: str) -> None:
+        self.ctx.emit("wake_state", state=state)
+
+    def _wake_busy(self) -> bool:
+        """Never fight the foreground recogniser, Piper or Android TTS for the mic."""
+        if not self.app_paused:
+            return True
+        if self.voice is not None and self.voice.state == "listening":
+            return True
+        return self.tts_state == "speaking"
+
+    def _on_wake_word(self) -> None:
+        # Runs on the wake worker while the Kivy clock is paused, so the
+        # activity intent must be fired directly from this thread.
+        LOG.info("wake word detected in the background")
+        self.bridge.launch_app("float_chat")
 
     def _confirm(self, question: str, detail: str = "") -> bool:
         app = self.app
@@ -15893,6 +16456,8 @@ class BoshraCore:
             if self.voice is not None:
                 self.voice.stop()
         with contextlib.suppress(Exception):
+            self.wake.stop()
+        with contextlib.suppress(Exception):
             self.tts.stop()
         with contextlib.suppress(Exception):
             self.llm.unload()
@@ -15939,6 +16504,8 @@ class BoshraCore:
         if self._shutting_down:
             return
         self._shutting_down = True
+        with contextlib.suppress(Exception):
+            self.wake.stop()
         with contextlib.suppress(Exception):
             self.orchestrator.stop_event.set()
         with contextlib.suppress(Exception):
@@ -16277,7 +16844,12 @@ class BoshraApp(App):
             self.core.ui_sound.warm_up()
         if self.core.config.float_start_on_launch and not self.core.config.float_enabled:
             self.core.config.set("float_enabled", True)
-        Clock.schedule_once(lambda _dt: self._sync_float(), 1.0)
+        def sync_background(_dt: float) -> None:
+            self.core.bridge.float_set_app_foreground(True)
+            self._sync_float()
+            self._sync_wake_state()
+
+        Clock.schedule_once(sync_background, 1.0)
         Clock.schedule_once(lambda _dt: self._background_upkeep(), 2.5)
         if self._smoke_mode:
             Clock.schedule_once(self._smoke_capture, 3.0)
@@ -16314,20 +16886,37 @@ class BoshraApp(App):
             self._mini_visible = desired
             self._apply_orb_visibility()
             return
-        if status.get("suppressed"):
+        if status.get("user_hidden") and not running:
+            # "Hide sphere" in the menu/notification is an explicit off switch.
+            self.core.bridge.float_clear_user_hidden()
+            if config.wake_enabled:
+                config.set("wake_enabled", False)
+                self.core.wake.stop()
+            self.core.bridge.float_set_listening(False)
             if desired:
                 config.set("float_enabled", False)
             desired = False
+        # "suppressed" is only "the app is in the foreground"; it must not
+        # rewrite the user's preference.
         if not granted:
-            if running:
+            if running and desired:
                 self._adopt_float_position()
                 self.core.bridge.float_stop()
                 running = False
+            if config.wake_enabled:
+                if not running:
+                    self.core.bridge.float_start(
+                        58, self.core.config.sphere_color, self.core.config.sphere_style,
+                        self._orb_display_fraction(), require_overlay=False,
+                    )
+                self.core.wake.start()
             self._float_running = False
             self._mini_visible = desired
             self._apply_orb_visibility()
             return
-        if desired and not running:
+        if desired:
+            # Idempotent: SHOW also re-adds the overlay if it was skipped while
+            # the service was running for the wake word only.
             outcome = self.core.bridge.float_start(
                 58, self.core.config.sphere_color, self.core.config.sphere_style,
                 self._orb_display_fraction(),
@@ -16336,15 +16925,46 @@ class BoshraApp(App):
                 running = True
             else:
                 LOG.warning(f"float start failed: {outcome.get('error')}")
-        elif running and not desired:
+        elif running:
             self._adopt_float_position()
             self.core.bridge.float_stop()
             running = False
+            if config.wake_enabled:
+                # The service hosts the wake thread; killing it stops listening.
+                config.set("wake_enabled", False)
+                self.core.wake.stop()
         self._float_running = running
         self._mini_visible = desired and not running
         self._apply_orb_visibility()
         if running:
             self._adopt_float_position()
+        if config.wake_enabled or running:
+            self.core.wake.start()
+        elif not config.wake_enabled:
+            self.core.wake.stop()
+
+    def _sync_wake_state(self) -> None:
+        """Treat the notification's listening action as the runtime kill switch."""
+        if not IS_ANDROID:
+            return
+        core = self.core
+        status = core.bridge.float_status()
+        listening = bool(status.get("listening"))
+        enabled = bool(core.config.wake_enabled)
+        if enabled and not listening:
+            core.config.set("wake_enabled", False)
+            core.wake.stop()
+        elif listening and not enabled:
+            # The user tapped "Listen" in the notification while in the app.
+            core.config.set("wake_enabled", True)
+            core.wake.start()
+        if core.config.wake_enabled and not status.get("running"):
+            # Wake needs the foreground service to survive backgrounding even
+            # when the sphere itself is switched off.
+            core.bridge.float_start(
+                58, core.config.sphere_color, core.config.sphere_style,
+                self._orb_display_fraction(), require_overlay=False,
+            )
 
     def _request_shared_storage_access(self) -> None:
         """Open Android's all-files grant once when /sdcard/assets is unreadable."""
@@ -16695,6 +17315,12 @@ class BoshraApp(App):
         # Keep the real size while hidden so saved coordinates stay meaningful.
         orb.size = (dp(54), dp(54))
 
+    def _sink_to_float(self, delay: float = 0.5) -> None:
+        """Sink the full UI so only the sphere remains; its menu brings it back."""
+        if not IS_ANDROID:
+            return
+        Clock.schedule_once(lambda _dt: self.core.bridge.move_task_to_back(), delay)
+
     def toggle_float(self) -> None:
         config = self.core.config
         if IS_ANDROID:
@@ -16710,11 +17336,15 @@ class BoshraApp(App):
                         "اسمح بـ«العرض فوق التطبيقات الأخرى»، ثم فعّل العائم مجدداً.",
                     ), 6)
                     return
-                if status.get("running"):
+                if status.get("running") and bool(config.float_enabled):
                     self._adopt_float_position()
                     outcome = self.core.bridge.float_stop()
                     self._float_running = False
                     config.set("float_enabled", False)
+                    if config.wake_enabled:
+                        config.set("wake_enabled", False)
+                        self.core.wake.stop()
+                        self.core.bridge.float_set_listening(False)
                     self._mini_visible = False
                     self._apply_orb_visibility()
                     self.toast(str(outcome.get("message") or outcome.get("error") or ""), 3.5)
@@ -16729,6 +17359,7 @@ class BoshraApp(App):
                         self._mini_visible = False
                         self._apply_orb_visibility()
                         self.toast(T("Floating assistant is on.", "المساعد العائم يعمل."), 3.5)
+                        self._sink_to_float()
                     else:
                         self._mini_visible = True
                         self._apply_orb_visibility()
@@ -17435,19 +18066,29 @@ class BoshraApp(App):
 
     # -- lifecycle -------------------------------------------------------
     def on_pause(self) -> bool:
+        self.core.app_paused = True
         with contextlib.suppress(Exception):
             if self.core.voice is not None:
                 self.core.voice.stop()
         with contextlib.suppress(Exception):
             self.core.tts.stop()
+        with contextlib.suppress(Exception):
+            self.core.bridge.float_set_app_foreground(False)
+        with contextlib.suppress(Exception):
+            if self.core.config.wake_enabled or self.core.bridge.float_status().get("running"):
+                self.core.wake.start()
         return True
 
     def on_resume(self) -> bool:
+        self.core.app_paused = False
+        with contextlib.suppress(Exception):
+            self.core.bridge.float_set_app_foreground(True)
         self._refresh_insets_safe(0)
         self._rescan_assets_after_resume()
         self.update_chrome_status()
         self.update_telemetry()
         self._sync_float()
+        self._sync_wake_state()
         self._check_proactive()
         action = ""
         with contextlib.suppress(Exception):
